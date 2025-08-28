@@ -1,0 +1,9 @@
+/* Minimal polish over Bootstrap, dark-friendly */
+:root {
+  --brand: #5dd6ff;
+}
+.navbar .navbar-brand { color: var(--brand); }
+.card { border-radius: 14px; }
+pre { white-space: pre-wrap; }
+.table code { font-size: 0.85rem; }
+#asm-table td, #asm-table th { white-space: nowrap; }

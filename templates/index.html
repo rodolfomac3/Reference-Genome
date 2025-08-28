@@ -1,0 +1,289 @@
+{% extends "base.html" %}
+{% block title %}Reference Genome & Marker Finder{% endblock %}
+{% block content %}
+<div class="row g-4">
+  <div class="col-lg-5">
+    <div class="card shadow-sm">
+      <div class="card-body">
+        <h1 class="h4 mb-3">Reference Genome & Marker Finder</h1>
+        <form method="post" action="/search">
+          <div class="mb-3">
+            <label class="form-label">Organism name</label>
+            <input type="text" class="form-control" name="taxon_name" placeholder="e.g., Escherichia coli, Aedes aegypti" value="{{ name or '' }}">
+          </div>
+          <div class="mb-3">
+            <label class="form-label">DNA sequence (optional)</label>
+            <textarea class="form-control" name="dna_seq" rows="5" placeholder="ACGT...">{{ dna or '' }}</textarea>
+            <div class="form-text">Paste ≥80 bp to enable the quick BLAST hint.</div>
+          </div>
+          <div class="form-check mb-3">
+            <input class="form-check-input" type="checkbox" name="blast_hint" id="blast_hint" {% if do_blast %}checked{% endif %}>
+            <label class="form-check-label" for="blast_hint">Try quick BLAST hint (slow; remote NCBI)</label>
+          </div>
+
+          <hr class="my-3">
+
+          <h2 class="h6 text-secondary mb-2">Assembly filters</h2>
+          <div class="row">
+            <div class="col-6">
+              <label class="form-label">Status</label>
+              <select class="form-select" name="status_filter">
+                {% set st = status_filter or 'any' %}
+                {% for lab in ['any','Complete Genome','Chromosome','Scaffold','Contig'] %}
+                  {% set v = lab.lower() %}
+                  <option value="{{ v }}" {% if st==v %}selected{% endif %}>{{ lab }}</option>
+                {% endfor %}
+              </select>
+            </div>
+            <div class="col-6">
+              <label class="form-label">Min contig N50</label>
+              <input type="number" class="form-control" name="min_contig_n50" value="{{ min_contig_n50 or 0 }}" min="0" step="100000">
+            </div>
+          </div>
+          <div class="form-check mt-2">
+            <input class="form-check-input" type="checkbox" name="refseq_only" id="refseq_only" {% if refseq_only %}checked{% endif %}>
+            <label class="form-check-label" for="refseq_only">RefSeq/Representative only</label>
+          </div>
+          <div class="mt-3">
+            <label class="form-label">Sort by</label>
+            {% set sb = sort_by or 'score' %}
+            <select class="form-select" name="sort_by">
+              <option value="score" {% if sb=='score' %}selected{% endif %}>Overall score (best first)</option>
+              <option value="update_date" {% if sb=='update_date' %}selected{% endif %}>Last updated</option>
+              <option value="contig_n50" {% if sb=='contig_n50' %}selected{% endif %}>Contig N50</option>
+              <option value="scaffold_n50" {% if sb=='scaffold_n50' %}selected{% endif %}>Scaffold N50</option>
+              <option value="status" {% if sb=='status' %}selected{% endif %}>Assembly status</option>
+            </select>
+          </div>
+
+          <hr class="my-3">
+
+          <h2 class="h6 text-secondary mb-2">Primer selection helper</h2>
+          <label class="form-label">Intended platform / fragment length</label>
+          {% set ip = intended_platform or 'any' %}
+          <select class="form-select" name="intended_platform">
+            <option value="any" {% if ip=='any' %}selected{% endif %}>Any</option>
+            <option value="Sanger" {% if ip=='Sanger' %}selected{% endif %}>Sanger (500–900 bp)</option>
+            <option value="Illumina PE250" {% if ip=='Illumina PE250' %}selected{% endif %}>Illumina PE250 (~2×250 bp)</option>
+            <option value="Illumina PE300" {% if ip=='Illumina PE300' %}selected{% endif %}>Illumina PE300 (~2×300 bp)</option>
+            <option value="eDNA-short" {% if ip=='eDNA-short' %}selected{% endif %}>eDNA short (100–300 bp)</option>
+            <option value="ONT/PacBio" {% if ip=='ONT/PacBio' %}selected{% endif %}>Long-read (ONT/PacBio)</option>
+          </select>
+
+          {% if best %}
+            <input type="hidden" name="selected_accession" id="selected_accession" value="{{ selected_accession }}">
+          {% endif %}
+
+          <button type="submit" class="btn btn-primary mt-3">Find references & markers</button>
+        </form>
+
+        {% if error %}<div class="alert alert-danger mt-3">{{ error }}</div>{% endif %}
+        {% if warning %}<div class="alert alert-warning mt-3">{{ warning }}</div>{% endif %}
+      </div>
+    </div>
+  </div>
+
+  <div class="col-lg-7">
+    {% if tax_info %}
+      <div class="card shadow-sm mb-4">
+        <div class="card-body">
+          <div class="d-flex justify-content-between align-items-center">
+            <h2 class="h5 mb-0">Taxonomy</h2>
+            <button class="btn btn-sm btn-outline-secondary" type="button" data-bs-toggle="collapse" data-bs-target="#lineage">Lineage</button>
+          </div>
+          <div>Scientific name: <strong>{{ tax_info.scientific_name }}</strong> (taxid {{ tax_info.taxid }})</div>
+          <div id="lineage" class="collapse mt-2">
+            <pre class="mb-0 small">{{ tax_info.lineage }}</pre>
+          </div>
+        </div>
+      </div>
+    {% endif %}
+
+    {% if best %}
+      <div class="card shadow-sm mb-4">
+        <div class="card-body">
+          <h2 class="h5 mb-3">Selected Assembly</h2>
+          <div class="row">
+            <div class="col-md-7">
+              <div class="mb-1"><strong>{{ best.assembly_name }}</strong></div>
+              <div class="text-secondary small mb-2">Accession: <code>{{ best.assembly_accession }}</code></div>
+              <ul class="list-unstyled small">
+                <li>RefSeq category: <code>{{ best.refseq_category or '—' }}</code></li>
+                <li>Status: <code>{{ best.assembly_status }}</code></li>
+                <li>Contig N50: <code>{{ "{:,}".format(best.contig_n50) }}</code></li>
+                <li>Scaffold N50: <code>{{ "{:,}".format(best.scaffold_n50) }}</code></li>
+                <li>Size: <code>{{ best.size_mb }} Mb</code></li>
+                <li>FTP: {% if best.ftp %}<a href="{{ best.ftp }}" target="_blank" rel="noopener">{{ best.ftp }}</a>{% else %}—{% endif %}</li>
+              </ul>
+            </div>
+            <div class="col-md-5">
+              {% if links %}
+                <h3 class="h6">Direct downloads</h3>
+                <ul class="small mb-0">
+                  <li><a href="{{ links.genomic_fna }}" target="_blank" rel="noopener">Genome FASTA (.fna.gz)</a></li>
+                  <li><a href="{{ links.cds_from_genomic }}" target="_blank" rel="noopener">CDS from genomic (.fna.gz)</a></li>
+                  <li><a href="{{ links.protein_faa }}" target="_blank" rel="noopener">Proteins (.faa.gz)</a></li>
+                  <li><a href="{{ links.genomic_gff }}" target="_blank" rel="noopener">Annotations GFF (.gff.gz)</a></li>
+                  <li><a href="{{ links.genomic_gbff }}" target="_blank" rel="noopener">GenBank flatfile (.gbff.gz)</a></li>
+                  <li><a href="{{ links.assembly_report }}" target="_blank" rel="noopener">Assembly report</a></li>
+                  <li><a href="{{ links.assembly_stats }}" target="_blank" rel="noopener">Assembly stats</a></li>
+                  <li><a href="{{ links.hashes_md5 }}" target="_blank" rel="noopener">MD5 checksums</a></li>
+                </ul>
+              {% endif %}
+            </div>
+          </div>
+        </div>
+      </div>
+    {% endif %}
+
+    {% if ranked %}
+      <div class="card shadow-sm mb-4">
+        <div class="card-body">
+          <h2 class="h5 mb-3">Assemblies (filtered & sorted)</h2>
+          <div class="table-responsive">
+            <table class="table table-sm table-hover align-middle" id="asm-table">
+              <thead>
+                <tr>
+                  <th></th>
+                  <th>Accession</th>
+                  <th>Name</th>
+                  <th>RefSeq category</th>
+                  <th>Status</th>
+                  <th>Contig N50</th>
+                  <th>Scaffold N50</th>
+                  <th>Size (Mb)</th>
+                  <th>Updated</th>
+                </tr>
+              </thead>
+              <tbody>
+                {% for r in ranked %}
+                <tr data-accession="{{ r.assembly_accession }}">
+                  <td style="width:36px">
+                    <input class="form-check-input pick-asm" type="radio" name="pick" {% if r.assembly_accession == selected_accession %}checked{% endif %}>
+                  </td>
+                  <td><code>{{ r.assembly_accession }}</code></td>
+                  <td>{{ r.assembly_name }}</td>
+                  <td><code>{{ r.refseq_category }}</code></td>
+                  <td><code>{{ r.assembly_status }}</code></td>
+                  <td>{{ "{:,}".format(r.contig_n50) }}</td>
+                  <td>{{ "{:,}".format(r.scaffold_n50) }}</td>
+                  <td>{{ r.size_mb }}</td>
+                  <td class="text-nowrap">{{ r.update_date }}</td>
+                </tr>
+                {% endfor %}
+              </tbody>
+            </table>
+          </div>
+          <div class="text-secondary small">Tip: pick a row to set the “Selected Assembly” above and refresh links.</div>
+        </div>
+      </div>
+    {% endif %}
+
+    {% if suggestions %}
+      <div class="card shadow-sm mb-4">
+        <div class="card-body">
+          <h2 class="h5 mb-3">Recommended Markers & Primers</h2>
+
+          {% set ip = intended_platform or 'any' %}
+          <p class="small text-secondary">
+            The table shows typical <em>amplicon length</em>, best-fit <em>platforms</em>, and <em>use cases</em>. Your chosen platform:
+            <strong>{{ ip }}</strong>{% if ip!='any' %} — rows matching your platform are marked <span class="badge bg-success-subtle text-success-emphasis">Recommended</span>{% endif %}.
+          </p>
+
+          {% for s in suggestions %}
+            <h3 class="h6 mt-3">{{ s.marker }}</h3>
+            <div class="text-secondary small mb-2">{{ s.notes }}</div>
+            <div class="table-responsive">
+              <table class="table table-sm table-hover align-middle">
+                <thead>
+                  <tr>
+                    <th>Name</th>
+                    <th>Forward</th>
+                    <th>Reverse</th>
+                    <th class="text-nowrap">Amplicon</th>
+                    <th>Platforms</th>
+                    <th>Use case</th>
+                    <th>Refs</th>
+                    <th></th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {% for p in s.primers %}
+                  {% set match = (ip=='any' or (p.platforms and ip in p.platforms)) %}
+                  <tr>
+                    <td>
+                      {{ p.name }}
+                      {% if match and ip!='any' %}
+                        <span class="badge bg-success-subtle text-success-emphasis ms-1">Recommended</span>
+                      {% endif %}
+                    </td>
+                    <td><code>{{ p.fwd }}</code></td>
+                    <td><code>{{ p.rev }}</code></td>
+                    <td class="text-nowrap">{{ p.amplicon_bp or '—' }}</td>
+                    <td>
+                      {% if p.platforms %}
+                        <span class="small">{{ p.platforms|join(', ') }}</span>
+                      {% else %}—{% endif %}
+                    </td>
+                    <td class="small">{{ p.use or '—' }}</td>
+                    <td class="small">
+                      {% if p.refs %}
+                        {% for r in p.refs %}
+                          <a href="{{ r.url }}" target="_blank" rel="noopener">{{ r.label }}</a>{% if not loop.last %}, {% endif %}
+                        {% endfor %}
+                      {% else %}—{% endif %}
+                    </td>
+                    <td><button class="btn btn-sm btn-outline-primary copy-btn" data-copy="{{ p.fwd }}\t{{ p.rev }}">Copy</button></td>
+                  </tr>
+                  {% endfor %}
+                </tbody>
+              </table>
+            </div>
+          {% endfor %}
+        </div>
+      </div>
+    {% endif %}
+
+    {% if blast_html %}
+      <div class="card shadow-sm mb-4">
+        <div class="card-body">
+          <h2 class="h5 mb-3">Sequence ID (quick BLAST hint)</h2>
+          <div class="table-responsive">
+            {{ blast_html | safe }}
+          </div>
+        </div>
+      </div>
+    {% endif %}
+  </div>
+</div>
+
+<script>
+  // pick assembly → set hidden input and resubmit the main form with current filters
+  document.querySelectorAll('.pick-asm').forEach(radio => {
+    radio.addEventListener('change', (e) => {
+      const tr = e.target.closest('tr');
+      const acc = tr?.dataset?.accession;
+      const hidden = document.getElementById('selected_accession');
+      if (acc && hidden) {
+        hidden.value = acc;
+        document.querySelector('form[action="/search"]').submit();
+      }
+    });
+  });
+
+  // copy primers
+  document.querySelectorAll('.copy-btn').forEach(btn => {
+    btn.addEventListener('click', async (e) => {
+      const text = e.target.getAttribute('data-copy');
+      try {
+        await navigator.clipboard.writeText(text);
+        e.target.textContent = 'Copied';
+        setTimeout(() => e.target.textContent = 'Copy', 1200);
+      } catch (err) {
+        e.target.textContent = 'Error';
+        setTimeout(() => e.target.textContent = 'Copy', 1200);
+      }
+    });
+  });
+</script>
+{% endblock %}

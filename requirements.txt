@@ -1,0 +1,6 @@
+Flask==3.0.3
+python-dotenv==1.0.1
+biopython==1.83
+pandas==2.2.2
+requests==2.32.3
+gunicorn==22.0.0

@@ -1,0 +1,11 @@
+# Python
+__pycache__/
+*.pyc
+
+# Envs & tooling
+.venv/
+env/
+.DS_Store
+
+# Secrets
+.env
