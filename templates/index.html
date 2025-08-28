@@ -1,23 +1,20 @@
 {% extends "base.html" %}
 {% block title %}Reference Genome & Marker Finder{% endblock %}
 {% block content %}
-<div class="row g-4">
+<div class="row gx-4 gy-4 min-vh-100">
   <!-- LEFT: Search + Filters -->
-  <div class="col-lg-5">
-    <div class="card shadow-sm">
-      <div class="card-body">
+  <div class="col-12 col-xl-5 d-flex flex-column">
+    <div class="card shadow-sm flex-fill">
+      <div class="card-body d-flex flex-column">
         <h1 class="h4 mb-1 d-flex align-items-center gap-2">
           <i class="bi bi-search"></i> Reference Genome & Marker Finder
         </h1>
         <p class="help-hint mb-3">Search a taxon, tweak filters, then pick an assembly. Primer suggestions adapt to your platform.</p>
 
         <form method="post" action="/search">
-          <!-- Taxon / Sequence -->
           <div class="mb-3">
             <label class="form-label">Organism name</label>
-            <input type="text" class="form-control" name="taxon_name"
-                   placeholder="e.g., Escherichia coli, Aedes aegypti"
-                   value="{{ name or '' }}">
+            <input type="text" class="form-control" name="taxon_name" placeholder="e.g., Escherichia coli, Aedes aegypti" value="{{ name or '' }}">
           </div>
 
           <div class="mb-3">
@@ -33,7 +30,6 @@
 
           <hr class="my-3">
 
-          <!-- Assembly filters -->
           <h2 class="h6 text-secondary mb-2">Assembly filters</h2>
           <div class="row">
             <div class="col-6">
@@ -48,8 +44,7 @@
             </div>
             <div class="col-6">
               <label class="form-label">Min contig N50</label>
-              <input type="number" class="form-control" name="min_contig_n50"
-                     value="{{ min_contig_n50 or 0 }}" min="0" step="100000">
+              <input type="number" class="form-control" name="min_contig_n50" value="{{ min_contig_n50 or 0 }}" min="0" step="100000">
             </div>
           </div>
 
@@ -72,7 +67,6 @@
 
           <hr class="my-3">
 
-          <!-- Primer selection helper -->
           <h2 class="h6 text-secondary mb-2">Primer selection helper</h2>
           <label class="form-label">Intended platform / fragment length</label>
           {% set ip = intended_platform or 'any' %}
@@ -85,15 +79,43 @@
             <option value="ONT/PacBio" {% if ip=='ONT/PacBio' %}selected{% endif %}>Long-read (ONT/PacBio)</option>
           </select>
 
-          {% if best %}
-            <input type="hidden" name="selected_accession" id="selected_accession" value="{{ selected_accession }}">
-          {% endif %}
+          <input type="hidden" name="selected_accession" id="selected_accession" value="{{ selected_accession or '' }}">
 
           <div class="d-flex align-items-center gap-2 mt-3">
             <button type="submit" class="btn btn-primary">Find references & markers</button>
-            <button type="reset" class="btn btn-link text-secondary">Reset</button>
+            <button type="button" id="reset-btn" class="btn btn-link text-secondary">Reset</button>
           </div>
         </form>
+
+        <!-- Export buttons: always visible, disabled until a search resolved -->
+        <div class="d-flex gap-2 mt-3">
+          {% set disabled = '' if tax_info else 'disabled' %}
+          <form method="post" action="/export/csv">
+            <input type="hidden" name="taxon_name" value="{{ name or '' }}">
+            <input type="hidden" name="dna_seq" value="{{ dna or '' }}">
+            <input type="hidden" name="blast_hint" value="{{ 'on' if do_blast else '' }}">
+            <input type="hidden" name="status_filter" value="{{ status_filter or 'any' }}">
+            <input type="hidden" name="min_contig_n50" value="{{ min_contig_n50 or 0 }}">
+            <input type="hidden" name="refseq_only" value="{{ 'on' if refseq_only else '' }}">
+            <input type="hidden" name="sort_by" value="{{ sort_by or 'score' }}">
+            <input type="hidden" name="selected_accession" value="{{ selected_accession or '' }}">
+            <input type="hidden" name="intended_platform" value="{{ intended_platform or 'any' }}">
+            <button class="btn btn-outline-primary btn-sm" type="submit" {{ disabled }}>Export CSV</button>
+          </form>
+
+          <form method="post" action="/export/pdf">
+            <input type="hidden" name="taxon_name" value="{{ name or '' }}">
+            <input type="hidden" name="dna_seq" value="{{ dna or '' }}">
+            <input type="hidden" name="blast_hint" value="{{ 'on' if do_blast else '' }}">
+            <input type="hidden" name="status_filter" value="{{ status_filter or 'any' }}">
+            <input type="hidden" name="min_contig_n50" value="{{ min_contig_n50 or 0 }}">
+            <input type="hidden" name="refseq_only" value="{{ 'on' if refseq_only else '' }}">
+            <input type="hidden" name="sort_by" value="{{ sort_by or 'score' }}">
+            <input type="hidden" name="selected_accession" value="{{ selected_accession or '' }}">
+            <input type="hidden" name="intended_platform" value="{{ intended_platform or 'any' }}">
+            <button class="btn btn-outline-primary btn-sm" type="submit" {{ disabled }}>Export PDF</button>
+          </form>
+        </div>
 
         {% if error %}<div class="alert alert-danger mt-3">{{ error }}</div>{% endif %}
         {% if warning %}<div class="alert alert-warning mt-3">{{ warning }}</div>{% endif %}
@@ -102,30 +124,23 @@
   </div>
 
   <!-- RIGHT: Results -->
-  <div class="col-lg-7">
-
+  <div class="col-12 col-xl-7 d-flex flex-column">
     {% if tax_info %}
-      <div class="card shadow-sm">
+      <div class="card shadow-sm mb-4">
         <div class="card-body">
           <div class="d-flex justify-content-between align-items-center">
             <h2 class="h5 mb-0"><i class="bi bi-diagram-3 me-2 text-info"></i>Taxonomy</h2>
-            <button class="btn btn-sm btn-outline-secondary"
-                    type="button"
-                    data-bs-toggle="collapse"
-                    data-bs-target="#lineage"
-                    data-bs-title="Show taxonomic lineage"
-                    data-bs-toggle="tooltip">Lineage</button>
+            <button class="btn btn-sm btn-outline-secondary" type="button"
+                    data-bs-toggle="collapse" data-bs-target="#lineage">Lineage</button>
           </div>
           <div>Scientific name: <strong>{{ tax_info.scientific_name }}</strong> (taxid {{ tax_info.taxid }})</div>
-          <div id="lineage" class="collapse mt-2">
-            <pre class="mb-0 small">{{ tax_info.lineage }}</pre>
-          </div>
+          <div id="lineage" class="collapse mt-2"><pre class="mb-0 small">{{ tax_info.lineage }}</pre></div>
         </div>
       </div>
     {% endif %}
 
     {% if best %}
-      <div class="card shadow-sm mt-4">
+      <div class="card shadow-sm mb-4">
         <div class="card-body">
           <div class="d-flex align-items-center justify-content-between mb-2">
             <h2 class="h5 mb-0"><i class="bi bi-dna me-2 text-info"></i>Selected Assembly</h2>
@@ -187,7 +202,7 @@
     {% endif %}
 
     {% if ranked %}
-      <div class="card shadow-sm mt-4">
+      <div class="card shadow-sm mb-4">
         <div class="card-body">
           <h2 class="h5 mb-3"><i class="bi bi-table me-2 text-info"></i>Assemblies (filtered &amp; sorted)</h2>
           <div class="table-responsive">
@@ -231,17 +246,10 @@
     {% endif %}
 
     {% if suggestions %}
-      <div class="card shadow-sm mt-4">
+      <div class="card shadow-sm mb-4">
         <div class="card-body">
           <h2 class="h5 mb-3"><i class="bi bi-bezier me-2 text-info"></i>Recommended Markers &amp; Primers</h2>
-
-          {% set ip = intended_platform or 'any' %}
-          <p class="small text-secondary">
-            The table shows typical <em>amplicon length</em>, best-fit <em>platforms</em>, and <em>use cases</em>.
-            Your chosen platform: <strong>{{ ip }}</strong>{% if ip!='any' %} — rows matching your platform are marked
-            <span class="badge badge-soft">Recommended</span>{% endif %}.
-          </p>
-
+          <p class="small text-secondary">Your chosen platform: <strong>{{ intended_platform or 'any' }}</strong></p>
           {% for s in suggestions %}
             <h3 class="h6 mt-3">{{ s.marker }}</h3>
             <div class="text-secondary small mb-2">{{ s.notes }}</div>
@@ -249,50 +257,31 @@
               <table class="table table-sm table-hover align-middle">
                 <thead>
                   <tr>
-                    <th>Name</th>
-                    <th>Forward</th>
-                    <th>Reverse</th>
-                    <th class="text-nowrap">Amplicon</th>
-                    <th>Platforms</th>
-                    <th>Use case</th>
-                    <th>Refs</th>
-                    <th></th>
+                    <th>Name</th><th>Forward</th><th>Reverse</th><th>Amplicon</th><th>Platforms</th><th>Use case</th><th>Refs</th><th></th>
                   </tr>
                 </thead>
                 <tbody>
                   {% for p in s.primers %}
-                    {% set match = (ip=='any' or (p.platforms and ip in p.platforms)) %}
-                    <tr>
-                      <td>
-                        {{ p.name }}
-                        {% if match and ip!='any' %}
-                          <span class="badge badge-soft ms-1"><i class="bi bi-stars me-1"></i>Recommended</span>
-                        {% endif %}
-                      </td>
-                      <td><code>{{ p.fwd }}</code></td>
-                      <td><code>{{ p.rev }}</code></td>
-                      <td class="text-nowrap">{{ p.amplicon_bp or '—' }}</td>
-                      <td>
-                        {% if p.platforms %}
-                          <span class="small">{{ p.platforms|join(', ') }}</span>
-                        {% else %}—{% endif %}
-                      </td>
-                      <td class="small">{{ p.use or '—' }}</td>
-                      <td class="small">
-                        {% if p.refs %}
-                          {% for r in p.refs %}
-                            <a href="{{ r.url }}" target="_blank" rel="noopener">{{ r.label }}</a>{% if not loop.last %}, {% endif %}
-                          {% endfor %}
-                        {% else %}—{% endif %}
-                      </td>
-                      <td>
-                        <button class="btn btn-sm btn-outline-primary copy-btn"
-                                data-copy="{{ p.fwd }}\t{{ p.rev }}"
-                                type="button">
-                          <i class="bi bi-clipboard"></i> Copy
-                        </button>
-                      </td>
-                    </tr>
+                  <tr>
+                    <td>{{ p.name }}</td>
+                    <td><code>{{ p.fwd }}</code></td>
+                    <td><code>{{ p.rev }}</code></td>
+                    <td>{{ p.amplicon_bp or '—' }}</td>
+                    <td>{{ p.platforms|join(', ') if p.platforms else '—' }}</td>
+                    <td class="small">{{ p.use or '—' }}</td>
+                    <td class="small">
+                      {% if p.refs %}
+                        {% for r in p.refs %}
+                          <a href="{{ r.url }}" target="_blank">{{ r.label }}</a>{% if not loop.last %}, {% endif %}
+                        {% endfor %}
+                      {% else %}—{% endif %}
+                    </td>
+                    <td>
+                      <button class="btn btn-sm btn-outline-primary copy-btn" data-copy="{{ p.fwd }}\t{{ p.rev }}" type="button">
+                        <i class="bi bi-clipboard"></i> Copy
+                      </button>
+                    </td>
+                  </tr>
                   {% endfor %}
                 </tbody>
               </table>
@@ -303,12 +292,10 @@
     {% endif %}
 
     {% if blast_html %}
-      <div class="card shadow-sm mt-4">
+      <div class="card shadow-sm mb-4">
         <div class="card-body">
           <h2 class="h5 mb-3"><i class="bi bi-bullseye me-2 text-info"></i>Sequence ID (quick BLAST hint)</h2>
-          <div class="table-responsive">
-            {{ blast_html | safe }}
-          </div>
+          <div class="table-responsive">{{ blast_html | safe }}</div>
         </div>
       </div>
     {% endif %}
@@ -317,7 +304,10 @@
 
 <!-- Page JS -->
 <script>
-  // Pick assembly → set hidden input + submit main form
+  // Reset → fresh page
+  document.getElementById('reset-btn')?.addEventListener('click', () => { window.location.href = "/"; });
+
+  // Pick assembly → submit with hidden field
   document.querySelectorAll('.pick-asm').forEach(radio => {
     radio.addEventListener('change', (e) => {
       const tr = e.target.closest('tr');
@@ -334,12 +324,8 @@
   document.querySelectorAll('.copy-btn').forEach(btn => {
     btn.addEventListener('click', async (e) => {
       const text = e.currentTarget.getAttribute('data-copy');
-      try {
-        await navigator.clipboard.writeText(text);
-        if (window.mfToast) window.mfToast('Primer pair copied');
-      } catch (err) {
-        if (window.mfToast) window.mfToast('Copy failed');
-      }
+      try { await navigator.clipboard.writeText(text); window.mfToast && mfToast('Primer pair copied'); }
+      catch { window.mfToast && mfToast('Copy failed'); }
     });
   });
 </script>
