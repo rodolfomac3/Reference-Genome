@@ -1,0 +1,267 @@
+{% extends "base.html" %}
+{% block title %}Primer Wizard · Marker Finder{% endblock %}
+
+{% block content %}
+<div class="row g-4">
+  <!-- Controls -->
+  <div class="col-12 col-lg-4">
+    <div class="card h-100">
+      <div class="card-body">
+        <h5 class="card-title"><i class="bi bi-bezier me-2"></i>Primer Wizard</h5>
+        <p class="help-hint">Design primers for your target taxon &amp; locus with platform-aware constraints.</p>
+
+        <form action="/designer/run" method="post" enctype="multipart/form-data">
+          <hr class="my-3 opacity-25">
+          <div class="small text-secondary mb-2">Step 1 — Goal &amp; platform</div>
+
+          <div class="mb-2">
+            <label class="form-label">Goal</label>
+            <select name="goal" class="form-select">
+              <option {{ 'selected' if goal=='metabarcoding' }}>Metabarcoding (community)</option>
+              <option {{ 'selected' if goal=='qPCR' }}>qPCR (detection)</option>
+              <option {{ 'selected' if goal=='barcoding' }}>Barcoding (single specimen)</option>
+            </select>
+          </div>
+
+          <div class="mb-2">
+            <label class="form-label">Platform</label>
+            <select name="platform" class="form-select">
+              <option {{ 'selected' if platform=='Illumina PE250' }}>Illumina PE250</option>
+              <option {{ 'selected' if platform=='Illumina PE300' }}>Illumina PE300</option>
+              <option {{ 'selected' if platform=='Sanger' }}>Sanger</option>
+              <option {{ 'selected' if platform=='ONT/PacBio' }}>ONT/PacBio</option>
+            </select>
+          </div>
+
+          <div class="row g-2">
+            <div class="col-4">
+              <label class="form-label">Amp min</label>
+              <input name="amp_min" class="form-control" value="{{ amp_min }}">
+            </div>
+            <div class="col-4">
+              <label class="form-label">Amp opt</label>
+              <input name="amp_opt" class="form-control" value="{{ amp_opt }}">
+            </div>
+            <div class="col-4">
+              <label class="form-label">Amp max</label>
+              <input name="amp_max" class="form-control" value="{{ amp_max }}">
+            </div>
+          </div>
+
+          <hr class="my-3 opacity-25">
+          <div class="small text-secondary mb-2">Step 2 — Target taxon &amp; locus</div>
+
+          <div class="mb-2">
+            <label class="form-label">Taxon</label>
+            <input name="taxon" class="form-control" placeholder="Aedes aegypti" value="{{ taxon }}">
+          </div>
+
+          <div class="mb-2">
+            <label class="form-label">Locus</label>
+            <select name="locus" class="form-select">
+              {% for locus_opt in ['COI','12S','16S','ITS','18S','rbcL','matK','custom'] %}
+                <option value="{{ locus_opt }}" {{ 'selected' if locus==locus_opt }}>{{ locus_opt }}</option>
+              {% endfor %}
+            </select>
+            <div class="form-text">For <em>custom</em>, the sequence source below should provide the target region.</div>
+          </div>
+
+          <hr class="my-3 opacity-25">
+          <div class="small text-secondary mb-2">Step 3 — Sequence source</div>
+
+          <div class="form-check">
+            <input class="form-check-input" type="radio" name="source" value="ncbi" id="src1" {{ 'checked' if source=='ncbi' }}>
+            <label class="form-check-label" for="src1">Pull from NCBI (100 max)</label>
+          </div>
+          <div class="form-check">
+            <input class="form-check-input" type="radio" name="source" value="paste" id="src2" {{ 'checked' if source=='paste' }}>
+            <label class="form-check-label" for="src2">Paste FASTA / raw sequence</label>
+          </div>
+          <div class="form-check mb-2">
+            <input class="form-check-input" type="radio" name="source" value="upload" id="src3" {{ 'checked' if source=='upload' }}>
+            <label class="form-check-label" for="src3">Upload FASTA file</label>
+          </div>
+
+          <div class="mb-2">
+            <label class="form-label">Max sequences from NCBI</label>
+            <input name="max_seqs" class="form-control" value="{{ max_seqs }}">
+          </div>
+
+          <div class="mb-2">
+            <textarea class="form-control" rows="5" name="fasta_text" placeholder=">id1&#10;ACGT...">{{ request.form.get('fasta_text','') }}</textarea>
+          </div>
+          <div class="mb-3">
+            <input class="form-control" type="file" name="fasta_file" accept=".fa,.fasta,.txt">
+          </div>
+
+          <hr class="my-3 opacity-25">
+          <div class="small text-secondary mb-2">Step 4 — Constraints</div>
+
+          <div class="row g-2">
+            <div class="col-4">
+              <label class="form-label">Tm min</label>
+              <input name="tm_min" class="form-control" value="{{ tm_min }}">
+            </div>
+            <div class="col-4">
+              <label class="form-label">Tm opt</label>
+              <input name="tm_opt" class="form-control" value="{{ tm_opt }}">
+            </div>
+            <div class="col-4">
+              <label class="form-label">Tm max</label>
+              <input name="tm_max" class="form-control" value="{{ tm_max }}">
+            </div>
+          </div>
+
+          <div class="row g-2">
+            <div class="col-6">
+              <label class="form-label">GC % min</label>
+              <input name="gc_min" class="form-control" value="{{ gc_min }}">
+            </div>
+            <div class="col-6">
+              <label class="form-label">GC % max</label>
+              <input name="gc_max" class="form-control" value="{{ gc_max }}">
+            </div>
+          </div>
+
+          <hr class="my-3 opacity-25">
+          <div class="small text-secondary mb-2">Visualization</div>
+          <div class="d-flex gap-3 mb-3">
+            <div class="form-check">
+              <input class="form-check-input" type="radio" name="viz" id="viz1" value="entropy" {{ 'checked' if viz=='entropy' }}>
+              <label class="form-check-label" for="viz1">Entropy</label>
+            </div>
+            <div class="form-check">
+              <input class="form-check-input" type="radio" name="viz" id="viz2" value="logo" {{ 'checked' if viz=='logo' }}>
+              <label class="form-check-label" for="viz2">Sequence logo{% if not has_logomaker %} (install logomaker){% endif %}</label>
+            </div>
+          </div>
+
+          <div class="d-flex align-items-center gap-3">
+            <button class="btn btn-primary" type="submit"><i class="bi bi-rocket-takeoff me-1"></i>Design primers</button>
+            <a href="/designer" class="link-secondary small">Reset</a>
+          </div>
+
+          {% if seqs_count %}
+            <div class="small text-secondary mt-2">Loaded {{ seqs_count }} sequence(s).</div>
+          {% endif %}
+          {% if warning %}<div class="alert alert-warning mt-3">{{ warning }}</div>{% endif %}
+          {% if error %}<div class="alert alert-danger mt-3">{{ error }}</div>{% endif %}
+        </form>
+      </div>
+    </div>
+  </div>
+
+  <!-- Results -->
+  <div class="col-12 col-lg-8">
+    <div class="card">
+      <div class="card-body">
+        <h5 class="card-title"><i class="bi bi-diagram-3 me-2"></i>Designed primer candidates</h5>
+
+        {% if viz == 'logo' and logo_png %}
+          <div class="mb-3">
+            <img src="{{ logo_png }}" class="img-fluid rounded border border-secondary-subtle" alt="Sequence logo">
+            <div class="form-text">Sequence logo (A/C/G/T heights reflect frequency). Ticks every 50 bp.</div>
+          </div>
+        {% elif entropy_png %}
+          <div class="mb-2">
+            <img src="{{ entropy_png }}" class="img-fluid rounded border border-secondary-subtle" alt="Conservation plot">
+          </div>
+          <div class="form-text mb-3">
+            Conservation (lower entropy = more conserved). <span class="text-success">Green</span> = forward, <span class="text-danger">Red</span> = reverse, shaded = amplicon. Ticks every 50 bp. AA track shown for coding loci.
+          </div>
+        {% else %}
+          <p class="text-secondary">Run the wizard to generate primer candidates. You’ll see Tm/GC, penalties, and coverage against your sequence set. Use BLAST buttons to sanity-check specificity.</p>
+        {% endif %}
+
+        {% if designed %}
+          <!-- Compact summary under the plot: top 5 pairs -->
+          <div class="table-responsive mb-3">
+            <table class="table table-sm table-bordered align-middle">
+              <thead class="table-dark">
+                <tr>
+                  <th>Pair</th>
+                  <th>Forward (pos/len/Tm/GC)</th>
+                  <th>Reverse (pos/len/Tm/GC)</th>
+                  <th>Amplicon</th>
+                  <th>Penalty</th>
+                  <th>Coverage</th>
+                </tr>
+              </thead>
+              <tbody>
+                {% for d in designed[:5] %}
+                  <tr>
+                    <td>P{{ loop.index }}</td>
+                    <td><code>{{ d.left }}</code><br>
+                      <span class="text-secondary">pos {{ d.left_pos }}, len {{ d.left_len }}, Tm {{ d.tm_left }}°C, GC {{ d.gc_left }}%</span>
+                    </td>
+                    <td><code>{{ d.right }}</code><br>
+                      <span class="text-secondary">pos {{ d.right_pos }}, len {{ d.right_len }}, Tm {{ d.tm_right }}°C, GC {{ d.gc_right }}%</span>
+                    </td>
+                    <td>{{ d.amplicon_len }} bp</td>
+                    <td><span class="badge bg-secondary-subtle text-light">{{ d.penalty }}</span></td>
+                    <td>
+                      {% if d.coverage_total %}
+                        {{ d.coverage_pct }}% ({{ d.coverage_hits }}/{{ d.coverage_total }})
+                      {% else %}
+                        <span class="text-secondary">—</span>
+                      {% endif %}
+                    </td>
+                  </tr>
+                {% endfor %}
+              </tbody>
+            </table>
+          </div>
+
+          <!-- Full table -->
+          <div class="table-responsive">
+            <table class="table table-sm table-hover align-middle">
+              <thead>
+                <tr>
+                  <th>#</th>
+                  <th>Forward</th>
+                  <th>Reverse</th>
+                  <th>Tm (°C)</th>
+                  <th>GC %</th>
+                  <th>Amplicon</th>
+                  <th>Penalty</th>
+                  <th>Coverage</th>
+                  <th>BLAST</th>
+                </tr>
+              </thead>
+              <tbody>
+                {% for d in designed[:30] %}
+                  <tr>
+                    <td class="text-secondary">{{ loop.index }}</td>
+                    <td><code>{{ d.left }}</code></td>
+                    <td><code>{{ d.right }}</code></td>
+                    <td>{{ d.tm_left }} / {{ d.tm_right }}</td>
+                    <td>{{ d.gc_left }} / {{ d.gc_right }}</td>
+                    <td>{{ d.amplicon_len }}</td>
+                    <td><span class="badge bg-secondary-subtle text-light">{{ d.penalty }}</span></td>
+                    <td>{% if d.coverage_total %}{{ d.coverage_pct }}% ({{ d.coverage_hits }}/{{ d.coverage_total }}){% else %}<span class="text-secondary">—</span>{% endif %}</td>
+                    <td>
+                      <form action="/designer/blast" method="post" target="_blank" class="d-flex gap-1">
+                        <input type="hidden" name="primer" value="{{ d.left }}">
+                        <button class="btn btn-outline-primary btn-sm" type="submit" title="BLAST forward">F</button>
+                      </form>
+                      <form action="/designer/blast" method="post" target="_blank" class="d-flex gap-1 mt-1">
+                        <input type="hidden" name="primer" value="{{ d.right }}">
+                        <button class="btn btn-outline-danger btn-sm" type="submit" title="BLAST reverse">R</button>
+                      </form>
+                    </td>
+                  </tr>
+                {% endfor %}
+              </tbody>
+            </table>
+          </div>
+
+          <form action="/designer/export/csv" method="post" class="mt-2">
+            <textarea name="designed_json" class="d-none">{{ designed|tojson }}</textarea>
+            <button class="btn btn-outline-primary btn-sm" type="submit"><i class="bi bi-download me-1"></i>Export CSV</button>
+          </form>
+        {% endif %}
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}

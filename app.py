@@ -2,32 +2,48 @@
 import os
 import re
 import time
+import base64
+from io import BytesIO
 from functools import lru_cache
 from typing import Dict, List, Optional
 
 import pandas as pd
 from flask import Flask, render_template, request, make_response
 from dotenv import load_dotenv
+
+# Biopython / NCBI
 from Bio import Entrez
 from Bio.Blast import NCBIWWW, NCBIXML
-from reportlab.platypus import LongTable  
-from reportlab.lib.pagesizes import LETTER, landscape
-from reportlab.lib.enums import TA_LEFT, TA_RIGHT
-from reportlab.pdfbase.pdfmetrics import stringWidth
+from Bio.Seq import Seq
 
-# --- SSL trust (helps on macOS if CERTIFICATE_VERIFY_FAILED) ---
+# SSL trust (helps on macOS if CERTIFICATE_VERIFY_FAILED)
 import ssl, certifi, urllib.request
 _ctx = ssl.create_default_context(cafile=certifi.where())
 urllib.request.install_opener(
     urllib.request.build_opener(urllib.request.HTTPSHandler(context=_ctx))
 )
 
-# --- PDF (ReportLab) ---
-from io import BytesIO
-from reportlab.lib.pagesizes import LETTER
+# PDF (ReportLab)
+from reportlab.lib.pagesizes import LETTER, landscape
 from reportlab.lib.styles import getSampleStyleSheet
 from reportlab.lib import colors
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, LongTable
+
+# Primer3
+import primer3
+
+# Plotting
+import matplotlib
+matplotlib.use("Agg")  # headless
+import matplotlib.pyplot as plt
+import numpy as np
+
+# Optional sequence logo
+try:
+    import logomaker as lm
+    HAS_LOGOMAKER = True
+except Exception:
+    HAS_LOGOMAKER = False
 
 # ----------------- Config -----------------
 load_dotenv()
@@ -72,40 +88,18 @@ def build_download_links(ftp: str):
     }
 
 def _styles():
-    """ReportLab styles used for the PDF."""
     s = getSampleStyleSheet()
-    # Base body
-    body = s["BodyText"]
-    body.fontSize = 9
-    body.leading = 12
-
-    small = s["BodyText"].clone('Small')
-    small.fontSize = 8
-    small.leading = 10
-
-    code = s["BodyText"].clone('Code')
-    code.fontName = "Courier"
-    code.fontSize = 8.5
-    code.leading = 10.5
-
-    h2 = s["Heading2"].clone('H2')
-    h2.spaceBefore = 8
-    h2.spaceAfter = 4
-
-    h3 = s["Heading3"].clone('H3')
-    h3.spaceBefore = 6
-    h3.spaceAfter = 3
-
-    title = s["Title"].clone('TitleX')
-    title.fontSize = 18
-    title.leading = 22
+    body = s["BodyText"]; body.fontSize = 9; body.leading = 12
+    small = s["BodyText"].clone('Small'); small.fontSize = 8; small.leading = 10
+    code = s["BodyText"].clone('Code'); code.fontName = "Courier"; code.fontSize = 8.5; code.leading = 10.5
+    h2 = s["Heading2"].clone('H2'); h2.spaceBefore = 8; h2.spaceAfter = 4
+    h3 = s["Heading3"].clone('H3'); h3.spaceBefore = 6; h3.spaceAfter = 3
+    title = s["Title"].clone('TitleX'); title.fontSize = 18; title.leading = 22
     return {"body": body, "small": small, "code": code, "h2": h2, "h3": h3, "title": title}
 
 def _para(text, style):
-    """Safe Paragraph builder for None/empty strings."""
     from reportlab.platypus import Paragraph
     txt = "" if text is None else str(text)
-    # Escape bare ampersands to avoid XML parse errors
     txt = txt.replace("&", "&amp;")
     return Paragraph(txt, style)
 
@@ -159,25 +153,18 @@ def best_assembly_for_taxid_raw(taxid: str) -> List[Dict]:
         cat = (d.get("RefSeq_category") or "")
         status = (d.get("AssemblyStatus") or "")
         ftp = d.get("FtpPath_RefSeq") or d.get("FtpPath_GenBank") or ""
-        try:
-            scaffold_n50 = int(d.get("ScaffoldN50") or 0)
-        except Exception:
-            scaffold_n50 = 0
-        try:
-            contig_n50 = int(d.get("ContigN50") or 0)
-        except Exception:
-            contig_n50 = 0
-        try:
-            size_mb = round(float(d.get("SeqLengthSum") or 0) / 1e6, 2)
-        except Exception:
-            size_mb = None
+        try: scaffold_n50 = int(d.get("ScaffoldN50") or 0)
+        except Exception: scaffold_n50 = 0
+        try: contig_n50 = int(d.get("ContigN50") or 0)
+        except Exception: contig_n50 = 0
+        try: size_mb = round(float(d.get("SeqLengthSum") or 0) / 1e6, 2)
+        except Exception: size_mb = None
 
         score = 0.0
         if cat and cat.lower() in ("reference genome", "representative genome"):
             score += 100
         score += max(0, 10 - _status_rank(status) * 3)
-        if ftp:
-            score += 5
+        if ftp: score += 5
         score += contig_n50 / 1e6 + scaffold_n50 / 1e6
 
         rows.append({
@@ -196,7 +183,7 @@ def best_assembly_for_taxid_raw(taxid: str) -> List[Dict]:
         })
     return rows
 
-# ---------- Primer Selection Helper ----------
+# ---------- Primer Recommendations (static, for main page) ----------
 def suggest_markers_from_lineage(lineage: str) -> List[Dict]:
     lin = (lineage or "").lower()
     out: List[Dict] = []
@@ -206,43 +193,43 @@ def suggest_markers_from_lineage(lineage: str) -> List[Dict]:
         add("16S rRNA (V3–V4 / V4)", [
             {"name": "341F / 805R", "fwd": "CCTACGGGNGGCWGCAG", "rev": "GACTACHVGGGTATCTAATCC",
              "amplicon_bp": "~460 bp (V3–V4)", "platforms": ["Illumina PE250","Illumina PE300"],
-             "use": "Microbiome profiling; widely used.", "refs": [{"label":"Klindworth 2013","url":"https://doi.org/10.1093/nar/gks808"}]},
+             "use": "Microbiome profiling; widely used."},
             {"name": "515F / 806R", "fwd": "GTGCCAGCMGCCGCGGTAA", "rev": "GGACTACHVGGGTWTCTAAT",
              "amplicon_bp": "~291 bp (V4)", "platforms": ["Illumina PE250","Illumina PE300","eDNA-short"],
-             "use": "EMP V4 standard.", "refs": [{"label":"EMP","url":"https://earthmicrobiome.org/"}]},
+             "use": "EMP V4 standard."},
             {"name": "27F / 1492R","fwd":"AGAGTTTGATCMTGGCTCAG","rev":"GGTTACCTTGTTACGACTT",
              "amplicon_bp":"≈1,450 bp", "platforms":["Sanger","ONT/PacBio"],
-             "use":"Full-length 16S for isolates.", "refs":[{"label":"Lane 1991","url":"https://doi.org/10.1016/0076-6879(91)94057-T"}]},
+             "use":"Full-length 16S for isolates."},
         ], "Choose region by platform/read length.")
     if "fungi" in lin or "fungus" in lin:
         add("ITS (ITS1–ITS2)", [
             {"name":"ITS1F / ITS2","fwd":"CTTGGTCATTTAGAGGAAGTAA","rev":"GCTGCGTTCTTCATCGATGC",
              "amplicon_bp":"~300–450 bp","platforms":["Illumina PE250","Illumina PE300","Sanger"],
-             "use":"Fungal metabarcoding (ITS1).","refs":[{"label":"UNITE","url":"https://unite.ut.ee/"}]},
+             "use":"Fungal metabarcoding (ITS1)."},
             {"name":"ITS3 / ITS4","fwd":"GCATCGATGAAGAACGCAGC","rev":"TCCTCCGCTTATTGATATGC",
              "amplicon_bp":"~300–500 bp","platforms":["Illumina PE250","Illumina PE300","Sanger"],
-             "use":"Fungal metabarcoding (ITS2).","refs":[{"label":"White 1990","url":"https://doi.org/10.1016/B978-0-12-372180-8.50042-1"}]},
+             "use":"Fungal metabarcoding (ITS2)."},
         ], "Primary fungal barcode.")
     if any(tag in lin for tag in ["viridiplantae","plantae","embryophyta","streptophyta"]):
         add("rbcL",[{"name":"rbcLa-F / rbcLa-R","fwd":"ATGTCACCACAAACAGAGACTAAAGC","rev":"GTAAAATCAAGTCCACCRCG",
-             "amplicon_bp":"~550–600 bp","platforms":["Sanger","Illumina PE300"],"use":"Core plant barcode.","refs":[{"label":"CBOL 2009","url":"https://doi.org/10.1073/pnas.0905845106"}]}],"Core plant barcode.")
+             "amplicon_bp":"~550–600 bp","platforms":["Sanger","Illumina PE300"],"use":"Core plant barcode."}],"Core plant barcode.")
         add("matK",[{"name":"matK-390F / matK-1326R","fwd":"CGATCTATTCATTCAATATTTC","rev":"TCTAGCACACGAAAGTCGAAGT",
-             "amplicon_bp":"~900 bp","platforms":["Sanger","ONT/PacBio"],"use":"Higher resolution with rbcL.","refs":[{"label":"CBOL 2009","url":"https://doi.org/10.1073/pnas.0905845106"}]}],"Use with rbcL.")
+             "amplicon_bp":"~900 bp","platforms":["Sanger","ONT/PacBio"],"use":"Higher resolution with rbcL."}],"Use with rbcL.")
         add("trnL (P6 mini)",[{"name":"g / h","fwd":"GGGCAATCCTGAGCCAA","rev":"CCATTGAGTCTCTGCACCTATC",
-             "amplicon_bp":"~10–150 bp","platforms":["eDNA-short","Illumina PE250"],"use":"Degraded DNA/eDNA.","refs":[{"label":"Taberlet 2007","url":"https://doi.org/10.1093/nar/gkm938"}]}],"Short eDNA-friendly locus.")
+             "amplicon_bp":"~10–150 bp","platforms":["eDNA-short","Illumina PE250"],"use":"Degraded DNA/eDNA."}],"Short eDNA-friendly locus.")
     if "metazoa" in lin or "animalia" in lin:
         add("COI (Folmer region)",[
             {"name":"LCO1490 / HCO2198","fwd":"GGTCAACAAATCATAAAGATATTGG","rev":"TAAACTTCAGGGTGACCAAAAAATCA",
-             "amplicon_bp":"~650 bp","platforms":["Sanger","Illumina PE300","ONT/PacBio"],"use":"Standard animal barcode.","refs":[{"label":"Folmer 1994","url":"https://doi.org/10.1016/0003-2697(94)90013-2"}]}
+             "amplicon_bp":"~650 bp","platforms":["Sanger","Illumina PE300","ONT/PacBio"],"use":"Standard animal barcode."}
         ], "Standard animal barcode.")
         add("12S (eDNA vertebrates)",[
             {"name":"MiFish-U","fwd":"GTCGGTAAAACTCGTGCCAGC","rev":"CATAGTGGGGTATCTAATCCCAGTTTG",
-             "amplicon_bp":"~170 bp","platforms":["eDNA-short","Illumina PE250"],"use":"Vertebrate eDNA surveys.","refs":[{"label":"Miya 2015","url":"https://doi.org/10.1098/rsos.150088"}]}
+             "amplicon_bp":"~170 bp","platforms":["eDNA-short","Illumina PE250"],"use":"Vertebrate eDNA surveys."}
         ], "Great for vertebrate eDNA.")
     if "eukaryota" in lin and not any(k in lin for k in ["animalia","plantae","fungi"]):
         add("18S rRNA (V4 / V9)",[
             {"name":"18S V4 (general)","fwd":"CCAGCASCYGCGGTAATTCC","rev":"ACTTTCGTTCTTGATYRA",
-             "amplicon_bp":"~380–420 bp (V4)","platforms":["Illumina PE250","Illumina PE300","Sanger"],"use":"Pan-eukaryote survey.","refs":[{"label":"Stoeck 2010","url":"https://doi.org/10.1111/j.1365-294X.2010.04695.x"}]}
+             "amplicon_bp":"~380–420 bp (V4)","platforms":["Illumina PE250","Illumina PE300","Sanger"],"use":"Pan-eukaryote survey."}
         ], "Pan-eukaryotic survey marker.")
     return out
 
@@ -320,7 +307,295 @@ def build_context_from_request(form):
         "links": links, "suggestions": suggestions
     }
 
-# ----------------- Routes -----------------
+# =================== Primer Wizard helpers ===================
+
+LOCUS_ALIASES = {
+    "COI": ['COI', 'cox1', '"cytochrome c oxidase subunit I"'],
+    "12S": ['12S'],
+    "16S": ['16S'],
+    "ITS": ['ITS', '"internal transcribed spacer"'],
+    "18S": ['18S'],
+    "rbcL": ['rbcL'],
+    "matK": ['matK'],
+}
+
+CODING_LOCI = {"COI", "rbcL", "matK"}  # AA overlay available for these
+
+def locus_query_string(locus: str) -> str:
+    locus = (locus or "").strip()
+    if locus in LOCUS_ALIASES:
+        parts = LOCUS_ALIASES[locus]
+        return "(" + " OR ".join(parts) + ")"
+    return locus
+
+def parse_fasta_string(fasta_text: str):
+    fasta_text = (fasta_text or "").strip()
+    if not fasta_text:
+        return []
+    records = []
+    if fasta_text.startswith(">"):
+        cur_id, cur_seq = None, []
+        for line in fasta_text.splitlines():
+            if line.startswith(">"):
+                if cur_id is not None:
+                    records.append({"id": cur_id, "seq": sanitize_dna("".join(cur_seq))})
+                cur_id = line[1:].strip() or "seq"
+                cur_seq = []
+            else:
+                cur_seq.append(line.strip())
+        if cur_id is not None:
+            records.append({"id": cur_id, "seq": sanitize_dna("".join(cur_seq))})
+    else:
+        records.append({"id": "seq1", "seq": sanitize_dna(fasta_text)})
+    return [r for r in records if r["seq"]]
+
+def fetch_ncbi_sequences_for_locus(taxon_name: str, locus: str, retmax: int = 100):
+    tax = ncbi_taxon_lookup(taxon_name) if taxon_name else None
+    if not tax:
+        return []
+    taxid = tax["taxid"]
+    locus_q = locus_query_string(locus)
+    term = f'{locus_q} AND txid{taxid}[Organism:exp] AND (biomol_genomic[PROP] OR biomol_mRNA[PROP])'
+    _sleep()
+    h = Entrez.esearch(db="nucleotide", term=term, retmax=retmax, retmode="xml")
+    rec = _entrez_read(h)
+    ids = rec.get("IdList", [])
+    if not ids:
+        return []
+    _sleep()
+    h2 = Entrez.efetch(db="nucleotide", id=",".join(ids), rettype="fasta", retmode="text")
+    fasta_txt = h2.read()
+    h2.close()
+    seqs = parse_fasta_string(fasta_txt)
+    seqs = [s for s in seqs if 80 <= len(s["seq"]) <= 8000]
+    return seqs
+
+def entropy_series(seqs):
+    if not seqs:
+        return []
+    L = min(len(s["seq"]) for s in seqs)
+    if L == 0:
+        return []
+    from math import log2
+    ent = []
+    for i in range(L):
+        col = [s["seq"][i] for s in seqs]
+        counts = {b: col.count(b) for b in "ACGT"}
+        total = sum(counts.values()) or 1
+        H = 0.0
+        for b in "ACGT":
+            p = counts[b] / total
+            if p > 0:
+                H -= p * log2(p)
+        ent.append(round(H, 3))
+    return ent
+
+def design_primers_on_region(seq: str, target_start: int = 0, target_len: int = None,
+                             amplicon_min=120, amplicon_opt=160, amplicon_max=320,
+                             tm_min=58, tm_opt=60, tm_max=62, gc_min=40, gc_max=60,
+                             num_return=30):
+    seq = sanitize_dna(seq)
+    if not seq:
+        return []
+    if target_len is None or target_len <= 0 or target_len > len(seq):
+        target_len = len(seq)
+    params = {
+        'SEQUENCE_ID': 'target',
+        'SEQUENCE_TEMPLATE': seq,
+        'SEQUENCE_TARGET': [target_start, target_len],
+    }
+    opts = {
+        'PRIMER_TASK': 'generic',
+        'PRIMER_PICK_LEFT_PRIMER': 1,
+        'PRIMER_PICK_RIGHT_PRIMER': 1,
+        'PRIMER_OPT_SIZE': 20,
+        'PRIMER_MIN_SIZE': 18,
+        'PRIMER_MAX_SIZE': 26,
+        'PRIMER_PRODUCT_SIZE_RANGE': [[amplicon_min, amplicon_max]],
+        'PRIMER_PRODUCT_OPT_SIZE': amplicon_opt,
+        'PRIMER_MIN_TM': tm_min, 'PRIMER_OPT_TM': tm_opt, 'PRIMER_MAX_TM': tm_max,
+        'PRIMER_MIN_GC': gc_min, 'PRIMER_MAX_GC': gc_max,
+        'PRIMER_MAX_POLY_X': 4,
+        'PRIMER_MAX_SELF_ANY_TH': 45.0,
+        'PRIMER_MAX_SELF_END_TH': 35.0,
+        'PRIMER_MAX_HAIRPIN_TH': 24.0,
+        'PRIMER_NUM_RETURN': int(num_return),
+    }
+    # Updated function name to avoid deprecation warning
+    res = primer3.bindings.design_primers(params, opts)
+    out = []
+    n = res.get('PRIMER_PAIR_NUM_RETURNED', 0)
+    for i in range(n):
+        left_pos, left_len = res.get(f'PRIMER_LEFT_{i}', [0,0])
+        right_pos, right_len = res.get(f'PRIMER_RIGHT_{i}', [0,0])
+        out.append({
+            'left':  res.get(f'PRIMER_LEFT_{i}_SEQUENCE'),
+            'right': res.get(f'PRIMER_RIGHT_{i}_SEQUENCE'),
+            'tm_left': round(res.get(f'PRIMER_LEFT_{i}_TM', 0.0), 2),
+            'tm_right': round(res.get(f'PRIMER_RIGHT_{i}_TM', 0.0), 2),
+            'gc_left': round(res.get(f'PRIMER_LEFT_{i}_GC_PERCENT', 0.0), 1),
+            'gc_right': round(res.get(f'PRIMER_RIGHT_{i}_GC_PERCENT', 0.0), 1),
+            'amplicon_len': res.get(f'PRIMER_PAIR_{i}_PRODUCT_SIZE'),
+            'penalty': round(res.get(f'PRIMER_PAIR_{i}_PENALTY', 0.0), 2),
+            'left_pos': left_pos,
+            'left_len': left_len,
+            'right_pos': right_pos,
+            'right_len': right_len,
+        })
+    out = [r for r in out if r['left'] and r['right']]
+    out.sort(key=lambda r: (r['penalty'], abs((r['amplicon_len'] or amplicon_opt) - amplicon_opt)))
+    return out
+
+def _match_allow_mismatch(primer: str, template: str, max_mismatch=1):
+    if not primer or not template or len(primer) != len(template):
+        return False
+    if primer[-1] != template[-1]:
+        return False
+    mism = sum(1 for a,b in zip(primer, template) if a != b)
+    return mism <= max_mismatch
+
+def insilico_coverage(primer_left: str, primer_right: str, seqs, max_mismatch=1):
+    if not seqs:
+        return {"hits":0, "total":0, "pct":0.0}
+    left = primer_left.upper()
+    right = primer_right.upper()
+    hits = 0
+    for s in seqs:
+        t = s["seq"]
+        if len(t) < 80:
+            continue
+        found_left = False
+        for i in range(0, len(t)-len(left)+1):
+            if _match_allow_mismatch(left, t[i:i+len(left)], max_mismatch=max_mismatch):
+                found_left = True
+                break
+        if not found_left:
+            continue
+        rc = str(Seq(t).reverse_complement())
+        found_right = False
+        for i in range(0, len(rc)-len(right)+1):
+            if _match_allow_mismatch(right, rc[i:i+len(right)], max_mismatch=max_mismatch):
+                found_right = True
+                break
+        if found_left and found_right:
+            hits += 1
+    total = len([s for s in seqs if len(s["seq"]) >= 80])
+    pct = round(100.0 * hits / total, 2) if total else 0.0
+    return {"hits": hits, "total": total, "pct": pct}
+
+# === Visualization helpers ===
+
+def _encode_fig_to_b64(fig, dpi=140):
+    buf = BytesIO()
+    fig.savefig(buf, format="png", dpi=dpi, bbox_inches="tight")
+    plt.close(fig)
+    buf.seek(0)
+    return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
+
+def make_entropy_plot(seqs, designed, locus: str):
+    """
+    Entropy bars with:
+      - x ticks every 50 bp
+      - labeled primer overlays (green/red arrows)
+      - shaded amplicon
+      - codon/AA track for coding loci (triplet aligned, AA labels every 9 bases)
+    """
+    if not seqs:
+        return None
+    ent = entropy_series(seqs)
+    L = len(ent)
+    x = np.arange(L)
+
+    fig, ax = plt.subplots(figsize=(13.5, 3.6))
+    ax.bar(x, ent, width=1.0, color="#66c2d0")
+    ax.set_ylim(0, max(1.8, max(ent) + 0.1))
+    ax.set_xlim(0, L)
+    ax.set_ylabel("Entropy", fontsize=10)
+    ax.set_xlabel("Position (bp)", fontsize=10)
+    ax.set_xticks(np.arange(0, L+1, 50))
+    ax.grid(axis='y', alpha=0.15)
+
+    # Overlays: up to 5 candidates with labels
+    for idx, d in enumerate((designed or [])[:5], start=1):
+        lp = d.get("left_pos", 0)
+        ll = d.get("left_len", 0)
+        rp = d.get("right_pos", 0)
+        rl = d.get("right_len", 0)
+        amp = d.get("amplicon_len", None)
+
+        # forward primer arrow + label
+        ax.annotate("",
+            xy=(lp + ll, -0.05), xycoords=("data","axes fraction"),
+            xytext=(lp, -0.05), textcoords=("data","axes fraction"),
+            arrowprops=dict(arrowstyle="->", color="#22c55e", lw=2))
+        ax.text(lp, -0.12, f"P{idx} F", color="#22c55e", fontsize=8,
+                ha="left", va="top", transform=ax.get_xaxis_transform())
+
+        # reverse primer arrow + label (from right inward)
+        ax.annotate("",
+            xy=(rp, -0.10), xycoords=("data","axes fraction"),
+            xytext=(rp + rl, -0.10), textcoords=("data","axes fraction"),
+            arrowprops=dict(arrowstyle="->", color="#ef4444", lw=2))
+        ax.text(rp + rl, -0.17, f"P{idx} R", color="#ef4444", fontsize=8,
+                ha="right", va="top", transform=ax.get_xaxis_transform())
+
+        # Amplicon span
+        span_start = lp + ll
+        span_end = rp
+        if span_end <= span_start and amp:
+            span_end = span_start + int(amp)
+        span_start = max(0, span_start)
+        span_end = min(L, span_end)
+        if span_end > span_start:
+            ax.axvspan(span_start, span_end, color="#a9def9", alpha=0.18)
+
+    # Codon/AA track for coding loci
+    if locus in CODING_LOCI and L >= 3:
+        ref = seqs[0]["seq"][:(L//3)*3]
+        aa = str(Seq(ref).translate())
+        codons = len(ref) // 3
+
+        # draw baseline and tick marks every codon
+        yline = -0.28
+        ax.text(0, yline+0.02, "AA:", transform=ax.transAxes, fontsize=8,
+                color="#94a3b8", ha="left", va="top")
+        for i in range(codons+1):
+            bp = i * 3
+            ax.axvline(bp, ymin=0, ymax=0.02, color="#94a3b833", lw=0.8)
+
+        # label AA every 3rd codon (every 9 bp) to reduce clutter
+        for i in range(0, codons, 3):
+            bp = i * 3 + 1
+            ax.text(bp, -0.34, aa[i], transform=ax.get_xaxis_transform(),
+                    fontsize=7.5, color="#cbd5e1", ha="center", va="top")
+
+    fig.tight_layout()
+    return _encode_fig_to_b64(fig)
+
+def make_logo_plot(seqs):
+    """Sequence logo (optional). We keep this as a toggle for users; entropy is the default."""
+    if not HAS_LOGOMAKER or not seqs:
+        return None
+    L = min(len(s["seq"]) for s in seqs)
+    if L == 0: return None
+    counts = pd.DataFrame(0, index=list("ACGT"), columns=range(L))
+    for s in seqs[:200]:  # cap for clarity
+        for i, b in enumerate(s["seq"][:L]):
+            if b in "ACGT":
+                counts.at[b, i] += 1
+    counts = counts.T
+    fig, ax = plt.subplots(figsize=(13.5, 3.1))
+    lm.Logo(counts, ax=ax, shade_below=.5, fade_below=.5, color_scheme="classic")
+    ax.set_xlim(0, L)
+    ax.set_xticks(np.arange(0, L+1, 50))
+    ax.set_xlabel("Position (bp)")
+    ax.set_ylabel("Bits")
+    ax.set_ylim(0, 2)  # Max info for DNA
+    ax.grid(axis='y', alpha=0.15)
+    fig.tight_layout()
+    return _encode_fig_to_b64(fig)
+
+# ----------------- Routes: Main -----------------
 @app.get("/")
 def index():
     return render_template("index.html")
@@ -329,7 +604,6 @@ def index():
 def search():
     ctx = build_context_from_request(request.form)
 
-    # optional BLAST (only for on-screen hint; we keep exports lean)
     blast_html = None
     if ctx["do_blast"] and ctx["dna"].strip():
         try:
@@ -357,7 +631,7 @@ def search():
         blast_html=blast_html, error=None, warning=None
     )
 
-# ----------------- Exports -----------------
+# ----------------- Exports: CSV/PDF -----------------
 @app.post("/export/csv")
 def export_csv():
     ctx = build_context_from_request(request.form)
@@ -382,10 +656,8 @@ def export_pdf():
         return ("No data to export. Provide an organism name first.", 400)
 
     st = _styles()
-
-    # Landscape Letter for more horizontal room
     buff = BytesIO()
-    margin = 28  # slightly tighter margins than default
+    margin = 28
     doc = SimpleDocTemplate(
         buff,
         pagesize=landscape(LETTER),
@@ -394,15 +666,12 @@ def export_pdf():
 
     story = []
 
-    # ----- Header / Title -----
     title = f"Marker Finder Report — {ctx['tax_info']['scientific_name']} (taxid {ctx['tax_info']['taxid']})"
     story += [_para(title, st["title"]), Spacer(1, 8)]
 
-    # ----- Selected Assembly -----
     best = ctx["best"]
     if best:
         story += [_para("<b>Selected Assembly</b>", st["h2"])]
-
         info_tbl = [
             [_para("Accession", st["small"]), _para(best["assembly_accession"], st["small"])],
             [_para("Name", st["small"]), _para(best["assembly_name"], st["small"])],
@@ -426,7 +695,6 @@ def export_pdf():
         ]))
         story += [t, Spacer(1, 8)]
 
-        # Direct links
         if ctx["links"]:
             story += [_para("<b>Direct downloads</b>", st["h3"])]
             link_rows = [[_para(k.replace("_"," "), st["small"]), _para(v, st["small"])] for k,v in ctx["links"].items()]
@@ -442,7 +710,6 @@ def export_pdf():
             ]))
             story += [lt, Spacer(1, 8)]
 
-    # ----- Assemblies (top 25) -----
     ranked = ctx["ranked"][:25]
     if ranked:
         story += [_para("<b>Assemblies (filtered &amp; sorted)</b>", st["h2"])]
@@ -476,7 +743,6 @@ def export_pdf():
         ]))
         story += [at, Spacer(1, 8)]
 
-    # ----- Primers -----
     if ctx["suggestions"]:
         story += [_para("<b>Recommended Markers &amp; Primers</b>", st["h2"])]
         for s in ctx["suggestions"]:
@@ -484,7 +750,6 @@ def export_pdf():
             if s.get("notes"):
                 story += [_para(s["notes"], st["small"])]
 
-            # Column widths tuned for landscape; use Paragraphs for wrapping
             cols = [110, 160, 160, 70, 140, 150]
             header = [
                 _para("Name", st["small"]),
@@ -498,7 +763,7 @@ def export_pdf():
             for p in s["primers"]:
                 rows.append([
                     _para(p.get("name",""), st["small"]),
-                    _para(p.get("fwd",""), st["code"]),   # monospace, wraps
+                    _para(p.get("fwd",""), st["code"]),
                     _para(p.get("rev",""), st["code"]),
                     _para(p.get("amplicon_bp",""), st["small"]),
                     _para(", ".join(p.get("platforms",[]) or []), st["small"]),
@@ -517,12 +782,11 @@ def export_pdf():
             ]))
             story += [pt, Spacer(1, 6)]
 
-    # ----- Page header/footer (page numbers) -----
     def footer(canvas, doc):
         canvas.saveState()
         canvas.setFont("Helvetica", 8)
         txt = f"Page {doc.page}"
-        canvas.drawRightString(doc.pagesize[0] - margin, margin - 12, txt)
+        canvas.drawRightString(doc.pagesize[0] - 28, 16, txt)
         canvas.restoreState()
 
     doc.build(story, onFirstPage=footer, onLaterPages=footer)
@@ -535,7 +799,153 @@ def export_pdf():
     resp.headers["Content-Disposition"] = f'attachment; filename="{safe}_marker_finder_report.pdf"'
     return resp
 
+# =================== Primer Wizard pages ===================
 
+@app.get("/designer")
+def designer():
+    ctx = {
+        "goal": "metabarcoding",
+        "platform": "Illumina PE250",
+        "amp_min": 120, "amp_opt": 160, "amp_max": 320,
+        "tm_min": 58, "tm_opt": 60, "tm_max": 62,
+        "gc_min": 40, "gc_max": 60,
+        "taxon": "", "locus": "COI",
+        "source": "ncbi",
+        "max_seqs": 100,
+        "viz": "entropy",  # 'entropy' or 'logo'
+        "designed": None, "seqs_count": 0,
+        "entropy_png": None, "logo_png": None,
+        "warning": None, "error": None,
+        "has_logomaker": HAS_LOGOMAKER,
+    }
+    return render_template("designer.html", **ctx)
+
+@app.post("/designer/run")
+def designer_run():
+    form = request.form
+    goal = form.get("goal") or "metabarcoding"
+    platform = form.get("platform") or "Illumina PE250"
+    amp_min = int(form.get("amp_min") or 120)
+    amp_opt = int(form.get("amp_opt") or 160)
+    amp_max = int(form.get("amp_max") or 320)
+    tm_min = float(form.get("tm_min") or 58)
+    tm_opt = float(form.get("tm_opt") or 60)
+    tm_max = float(form.get("tm_max") or 62)
+    gc_min = float(form.get("gc_min") or 40)
+    gc_max = float(form.get("gc_max") or 60)
+    taxon = (form.get("taxon") or "").strip()
+    locus = (form.get("locus") or "COI").strip()
+    source = form.get("source") or "ncbi"
+    max_seqs = int(form.get("max_seqs") or 100)
+    viz = form.get("viz") or "entropy"
+
+    seqs = []
+    warning = None
+    error = None
+    if source == "ncbi":
+        try:
+            seqs = fetch_ncbi_sequences_for_locus(taxon, locus, retmax=max_seqs)
+            if not seqs:
+                warning = "No sequences returned from NCBI for that taxon/locus filter."
+        except Exception as e:
+            error = f"NCBI fetch error: {e}"
+    elif source == "paste":
+        seqs = parse_fasta_string(form.get("fasta_text") or "")
+        if not seqs:
+            warning = "No sequences parsed from pasted text."
+    else:
+        f = request.files.get("fasta_file")
+        if f and f.filename:
+            data = f.read().decode("utf-8", errors="ignore")
+            seqs = parse_fasta_string(data)
+        if not seqs:
+            warning = "No sequences parsed from uploaded file."
+
+    ref_seq = seqs[0]["seq"] if seqs else ""
+    designed = []
+    entropy_png = None
+    logo_png = None
+
+    if ref_seq:
+        designed = design_primers_on_region(
+            ref_seq, 0, len(ref_seq),
+            amplicon_min=amp_min, amplicon_opt=amp_opt, amplicon_max=amp_max,
+            tm_min=tm_min, tm_opt=tm_opt, tm_max=tm_max,
+            gc_min=gc_min, gc_max=gc_max, num_return=30
+        )
+        for d in designed[:10]:
+            cov = insilico_coverage(d["left"], d["right"], seqs, max_mismatch=1)
+            d["coverage_pct"] = cov["pct"]
+            d["coverage_hits"] = cov["hits"]
+            d["coverage_total"] = cov["total"]
+
+        # Build plots
+        entropy_png = make_entropy_plot(seqs[:50], designed, locus=locus)
+        if HAS_LOGOMAKER:
+            logo_png = make_logo_plot(seqs[:200])
+
+    else:
+        warning = warning or "No reference sequence available to design primers."
+
+    ctx = {
+        "goal": goal, "platform": platform,
+        "amp_min": amp_min, "amp_opt": amp_opt, "amp_max": amp_max,
+        "tm_min": tm_min, "tm_opt": tm_opt, "tm_max": tm_max,
+        "gc_min": gc_min, "gc_max": gc_max,
+        "taxon": taxon, "locus": locus,
+        "source": source, "max_seqs": max_seqs,
+        "viz": viz,
+        "designed": designed, "seqs_count": len(seqs),
+        "entropy_png": entropy_png, "logo_png": logo_png,
+        "warning": warning, "error": error,
+        "has_logomaker": HAS_LOGOMAKER,
+    }
+    return render_template("designer.html", **ctx)
+
+@app.post("/designer/blast")
+def designer_blast():
+    primer = (request.form.get("primer") or "").strip().upper()
+    if not primer or len(primer) < 16:
+        return ("Primer too short for BLAST.", 400)
+    try:
+        rh = NCBIWWW.qblast("blastn", "nt", primer, hitlist_size=10)
+        record = NCBIXML.read(rh)
+        hits = []
+        for aln in record.alignments:
+            hsp = aln.hsps[0]
+            hits.append({
+                "title": aln.title[:140],
+                "e": f"{hsp.expect:.1e}",
+                "identity": round(100 * hsp.identities / max(1, hsp.align_length), 1),
+                "len": aln.length
+            })
+        rows = "".join(f"<tr><td>{h['identity']}%</td><td>{h['e']}</td><td>{h['len']}</td><td>{h['title']}</td></tr>" for h in hits)
+        html = f"""
+        <div class="table-responsive"><table class="table table-sm table-hover">
+        <thead><tr><th>%ID</th><th>E</th><th>Len</th><th>Title</th></tr></thead>
+        <tbody>{rows or '<tr><td colspan=4>No hits</td></tr>'}</tbody></table></div>
+        """
+        resp = make_response(html)
+        resp.headers["Content-Type"] = "text/html; charset=utf-8"
+        return resp
+    except Exception as e:
+        return (f"BLAST failed: {e}", 500)
+
+@app.post("/designer/export/csv")
+def designer_export_csv():
+    import json
+    designed_json = request.form.get("designed_json") or "[]"
+    try:
+        designed = pd.DataFrame(json.loads(designed_json))
+    except Exception:
+        return ("Bad payload.", 400)
+    if designed.empty:
+        return ("Nothing to export.", 400)
+    csv_bytes = designed.to_csv(index=False).encode("utf-8")
+    resp = make_response(csv_bytes)
+    resp.headers["Content-Type"] = "text/csv; charset=utf-8"
+    resp.headers["Content-Disposition"] = 'attachment; filename="designed_primers.csv"'
+    return resp
 
 # ----------------------------------------------------------------
 if __name__ == "__main__":
