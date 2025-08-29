@@ -63,7 +63,6 @@
                 <option value="{{ locus_opt }}" {{ 'selected' if locus==locus_opt }}>{{ locus_opt }}</option>
               {% endfor %}
             </select>
-            <div class="form-text">For <em>custom</em>, the sequence source below should provide the target region.</div>
           </div>
 
           <hr class="my-3 opacity-25">
@@ -97,7 +96,7 @@
           <hr class="my-3 opacity-25">
           <div class="small text-secondary mb-2">Step 4 — Constraints</div>
 
-          <div class="row g-2">
+          <div class="row g-2 mb-2">
             <div class="col-4">
               <label class="form-label">Tm min</label>
               <input name="tm_min" class="form-control" value="{{ tm_min }}">
@@ -112,7 +111,7 @@
             </div>
           </div>
 
-          <div class="row g-2">
+          <div class="row g-2 mb-2">
             <div class="col-6">
               <label class="form-label">GC % min</label>
               <input name="gc_min" class="form-control" value="{{ gc_min }}">
@@ -123,7 +122,104 @@
             </div>
           </div>
 
-          <hr class="my-3 opacity-25">
+          <div class="row g-2 mb-2">
+            <div class="col-4">
+              <label class="form-label">Len min</label>
+              <input name="len_min" class="form-control" value="{{ len_min }}">
+            </div>
+            <div class="col-4">
+              <label class="form-label">Len opt</label>
+              <input name="len_opt" class="form-control" value="{{ len_opt }}">
+            </div>
+            <div class="col-4">
+              <label class="form-label">Len max</label>
+              <input name="len_max" class="form-control" value="{{ len_max }}">
+            </div>
+          </div>
+
+          <details class="mb-2">
+            <summary class="mb-1"><strong>Advanced constraints</strong></summary>
+
+            <div class="form-check mb-2">
+              <input class="form-check-input" type="checkbox" name="enforce_gc_clamp" id="gcclamp" {{ 'checked' if enforce_gc_clamp=='on' }}>
+              <label class="form-check-label" for="gcclamp">Enforce 3′ GC clamp (within last 3 bases)</label>
+            </div>
+            <div class="row g-2 mb-2">
+              <div class="col-6">
+                <label class="form-label">Min GC in last 3</label>
+                <input name="min_gc3" class="form-control" value="{{ min_gc3 }}">
+              </div>
+              <div class="col-6">
+                <label class="form-label">Max GC in last 3</label>
+                <input name="max_gc3" class="form-control" value="{{ max_gc3 }}">
+              </div>
+            </div>
+
+            <div class="row g-2 mb-2">
+              <div class="col-6">
+                <label class="form-label">Max A/T run</label>
+                <input name="max_run_at" class="form-control" value="{{ max_run_at }}">
+              </div>
+              <div class="col-6">
+                <label class="form-label">Max G/C run</label>
+                <input name="max_run_gc" class="form-control" value="{{ max_run_gc }}">
+              </div>
+            </div>
+
+            <div class="mb-2">
+              <label class="form-label">Max dinucleotide repeats (e.g., ATAT..)</label>
+              <input name="max_dinuc" class="form-control" value="{{ max_dinuc }}">
+            </div>
+
+            <div class="row g-2 mb-2">
+              <div class="col-4">
+                <label class="form-label">ΔG hairpin ≥</label>
+                <input name="dg_hp_min" class="form-control" value="{{ dg_hp_min }}">
+              </div>
+              <div class="col-4">
+                <label class="form-label">ΔG self-dimer ≥</label>
+                <input name="dg_self_min" class="form-control" value="{{ dg_self_min }}">
+              </div>
+              <div class="col-4">
+                <label class="form-label">ΔG hetero-dimer ≥</label>
+                <input name="dg_hetero_min" class="form-control" value="{{ dg_hetero_min }}">
+              </div>
+            </div>
+
+            <div class="row g-2 mb-2">
+              <div class="col-6">
+                <label class="form-label">[Na⁺] mM</label>
+                <input name="mv_mM" class="form-control" value="{{ mv_mM }}">
+              </div>
+              <div class="col-6">
+                <label class="form-label">[Mg²⁺] mM</label>
+                <input name="dv_mM" class="form-control" value="{{ dv_mM }}">
+              </div>
+            </div>
+            <div class="row g-2 mb-2">
+              <div class="col-6">
+                <label class="form-label">[dNTP] mM</label>
+                <input name="dntp_mM" class="form-control" value="{{ dntp_mM }}">
+              </div>
+              <div class="col-6">
+                <label class="form-label">Primer conc (nM)</label>
+                <input name="dna_nM" class="form-control" value="{{ dna_nM }}">
+              </div>
+            </div>
+
+            <div class="row g-2">
+              <div class="col-6">
+                <label class="form-label">3′ k-mer length</label>
+                <input name="kmer_len" class="form-control" value="{{ kmer_len }}">
+              </div>
+              <div class="col-6">
+                <label class="form-label">Max matches (OK)</label>
+                <input name="kmer_max_hits" class="form-control" value="{{ kmer_max_hits }}">
+              </div>
+            </div>
+          </details>
+
+          <hr class="my-2 opacity-25">
           <div class="small text-secondary mb-2">Visualization</div>
           <div class="d-flex gap-3 mb-3">
             <div class="form-check">
@@ -167,10 +263,10 @@
             <img src="{{ entropy_png }}" class="img-fluid rounded border border-secondary-subtle" alt="Conservation plot">
           </div>
           <div class="form-text mb-3">
-            Conservation (lower entropy = more conserved). <span class="text-success">Green</span> = forward, <span class="text-danger">Red</span> = reverse, shaded = amplicon. Ticks every 50 bp. AA track shown for coding loci.
+            Conservation (lower entropy = more conserved). <span class="text-success">Green</span> = forward, <span class="text-danger">Red</span> = reverse, shaded = amplicon. Ticks every 50 bp. AA track for coding loci.
           </div>
         {% else %}
-          <p class="text-secondary">Run the wizard to generate primer candidates. You’ll see Tm/GC, penalties, and coverage against your sequence set. Use BLAST buttons to sanity-check specificity.</p>
+          <p class="text-secondary">Run the wizard to generate primer candidates. You’ll see Tm/GC, penalties, coverage, QC badges, and a 3′-end uniqueness score.</p>
         {% endif %}
 
         {% if designed %}
@@ -192,10 +288,10 @@
                   <tr>
                     <td>P{{ loop.index }}</td>
                     <td><code>{{ d.left }}</code><br>
-                      <span class="text-secondary">pos {{ d.left_pos }}, len {{ d.left_len }}, Tm {{ d.tm_left }}°C, GC {{ d.gc_left }}%</span>
+                      <span class="text-secondary">pos {{ d.left_pos }}, len {{ d.len_left }}, Tm {{ d.tm_left }}°C, GC {{ d.gc_left }}%</span>
                     </td>
                     <td><code>{{ d.right }}</code><br>
-                      <span class="text-secondary">pos {{ d.right_pos }}, len {{ d.right_len }}, Tm {{ d.tm_right }}°C, GC {{ d.gc_right }}%</span>
+                      <span class="text-secondary">pos {{ d.right_pos }}, len {{ d.len_right }}, Tm {{ d.tm_right }}°C, GC {{ d.gc_right }}%</span>
                     </td>
                     <td>{{ d.amplicon_len }} bp</td>
                     <td><span class="badge bg-secondary-subtle text-light">{{ d.penalty }}</span></td>
@@ -212,7 +308,7 @@
             </table>
           </div>
 
-          <!-- Full table -->
+          <!-- Full table with QC & 3' uniqueness -->
           <div class="table-responsive">
             <table class="table table-sm table-hover align-middle">
               <thead>
@@ -224,21 +320,62 @@
                   <th>GC %</th>
                   <th>Amplicon</th>
                   <th>Penalty</th>
+                  <th>3′ GC clamp</th>
+                  <th>Runs</th>
+                  <th>Di-nuc</th>
+                  <th>ΔG (HP/Self/Het)</th>
+                  <th>3′ uniq</th>
                   <th>Coverage</th>
                   <th>BLAST</th>
                 </tr>
               </thead>
               <tbody>
                 {% for d in designed[:30] %}
-                  <tr>
+                  {% set ok_runs = (d.homopoly_ok_f and d.homopoly_ok_r) %}
+                  {% set ok_dinuc = (d.dinuc_ok_f and d.dinuc_ok_r) %}
+                  <tr class="{% if not (d.gc3_ok and ok_runs and ok_dinuc and d.dg_ok and d.kmer_ok) %}table-warning{% endif %}">
                     <td class="text-secondary">{{ loop.index }}</td>
-                    <td><code>{{ d.left }}</code></td>
-                    <td><code>{{ d.right }}</code></td>
+                    <td style="max-width:280px"><code>{{ d.left }}</code></td>
+                    <td style="max-width:280px"><code>{{ d.right }}</code></td>
                     <td>{{ d.tm_left }} / {{ d.tm_right }}</td>
                     <td>{{ d.gc_left }} / {{ d.gc_right }}</td>
                     <td>{{ d.amplicon_len }}</td>
                     <td><span class="badge bg-secondary-subtle text-light">{{ d.penalty }}</span></td>
-                    <td>{% if d.coverage_total %}{{ d.coverage_pct }}% ({{ d.coverage_hits }}/{{ d.coverage_total }}){% else %}<span class="text-secondary">—</span>{% endif %}</td>
+
+                    <td>
+                      <span class="badge {% if d.gc3_ok %}bg-success{% else %}bg-danger{% endif %}">
+                        F {{ d.gc3_f }} / R {{ d.gc3_r }}
+                      </span>
+                    </td>
+
+                    <td>
+                      <span class="badge {% if ok_runs %}bg-success{% else %}bg-danger{% endif %}">poly</span>
+                    </td>
+
+                    <td>
+                      <span class="badge {% if ok_dinuc %}bg-success{% else %}bg-danger{% endif %}">2-mer</span>
+                    </td>
+
+                    <td>
+                      <span class="badge {% if d.dg_ok %}bg-success{% else %}bg-danger{% endif %}">
+                        {{ '%.1f'|format(d.dg_hp_left) }}/{{ '%.1f'|format(d.dg_self_left) }}/{{ '%.1f'|format(d.dg_hetero) }}
+                      </span>
+                    </td>
+
+                    <td>
+                      <span class="badge {% if d.kmer_ok %}bg-success{% else %}bg-danger{% endif %}">
+                        F {{ d.kmer_hits_f }} / R {{ d.kmer_hits_r }}
+                      </span>
+                    </td>
+
+                    <td>
+                      {% if d.coverage_total %}
+                        {{ d.coverage_pct }}% ({{ d.coverage_hits }}/{{ d.coverage_total }})
+                      {% else %}
+                        <span class="text-secondary">—</span>
+                      {% endif %}
+                    </td>
+
                     <td>
                       <form action="/designer/blast" method="post" target="_blank" class="d-flex gap-1">
                         <input type="hidden" name="primer" value="{{ d.left }}">

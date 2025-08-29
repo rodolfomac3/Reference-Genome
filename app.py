@@ -3,9 +3,10 @@ import os
 import re
 import time
 import base64
+import json
 from io import BytesIO
 from functools import lru_cache
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 from flask import Flask, render_template, request, make_response
@@ -390,15 +391,136 @@ def entropy_series(seqs):
         ent.append(round(H, 3))
     return ent
 
-def design_primers_on_region(seq: str, target_start: int = 0, target_len: int = None,
-                             amplicon_min=120, amplicon_opt=160, amplicon_max=320,
-                             tm_min=58, tm_opt=60, tm_max=62, gc_min=40, gc_max=60,
-                             num_return=30):
+# ---------- QC utilities (#1 & #3) ----------
+def _gc_clamp_ok(seq: str, min_gc3: int, max_gc3: int, clamp_span: int = 3) -> Tuple[int, bool]:
+    tail = seq[-clamp_span:]
+    gc_count = sum(1 for b in tail if b in "GC")
+    return gc_count, (min_gc3 <= gc_count <= max_gc3)
+
+def _max_homopolymer_run(seq: str) -> int:
+    best, cur, prev = 0, 0, ""
+    for b in seq:
+        if b == prev:
+            cur += 1
+        else:
+            prev, cur = b, 1
+        best = max(best, cur)
+    return best
+
+def _homopolymer_ok(seq: str, max_at: int, max_gc: int) -> bool:
+    runs = {"A":0,"C":0,"G":0,"T":0}
+    cur_b, cur_len = "", 0
+    ok = True
+    for b in seq:
+        if b == cur_b:
+            cur_len += 1
+        else:
+            if cur_b:
+                runs[cur_b] = max(runs[cur_b], cur_len)
+            cur_b, cur_len = b, 1
+    if cur_b:
+        runs[cur_b] = max(runs[cur_b], cur_len)
+    if max(runs["A"], runs["T"]) > max_at: ok = False
+    if max(runs["G"], runs["C"]) > max_gc: ok = False
+    return ok
+
+def _dinuc_ok(seq: str, max_repeats: int) -> bool:
+    # disallow > max_repeats of any dinucleotide like ATATAT...
+    if len(seq) < 4:
+        return True
+    for i in range(len(seq)-3):
+        di = seq[i:i+2]
+        reps = 1
+        j = i+2
+        while j+2 <= len(seq) and seq[j:j+2] == di:
+            reps += 1
+            j += 2
+        if reps > max_repeats:
+            return False
+    return True
+
+def _thermo_dGs(left: str, right: str, mv: float, dv: float, dntp: float, dna_nM: float) -> Dict[str, float]:
+    # primer3 returns objects with .dg (kcal/mol) and .structure_found
+    kwargs = dict(mv_conc=mv, dv_conc=dv, dntp_conc=dntp, dna_conc=dna_nM, temp_c=60)
+    try:
+        hpL = primer3.calcHairpin(left, **kwargs); dg_hpL = getattr(hpL, "dg", 0.0) or 0.0
+    except Exception:
+        dg_hpL = 0.0
+    try:
+        hpR = primer3.calcHairpin(right, **kwargs); dg_hpR = getattr(hpR, "dg", 0.0) or 0.0
+    except Exception:
+        dg_hpR = 0.0
+    try:
+        sdL = primer3.calcHomodimer(left, **kwargs); dg_sdL = getattr(sdL, "dg", 0.0) or 0.0
+    except Exception:
+        dg_sdL = 0.0
+    try:
+        sdR = primer3.calcHomodimer(right, **kwargs); dg_sdR = getattr(sdR, "dg", 0.0) or 0.0
+    except Exception:
+        dg_sdR = 0.0
+    try:
+        het = primer3.calcHeterodimer(left, right, **kwargs); dg_het = getattr(het, "dg", 0.0) or 0.0
+    except Exception:
+        dg_het = 0.0
+    return {
+        "dg_hp_left": float(dg_hpL),
+        "dg_hp_right": float(dg_hpR),
+        "dg_self_left": float(dg_sdL),
+        "dg_self_right": float(dg_sdR),
+        "dg_hetero": float(dg_het),
+    }
+
+def _dG_pass(dgs: Dict[str,float], th_hp: float, th_self: float, th_hetero: float) -> bool:
+    # thresholds are minimum acceptable (e.g., -2, -6, -7); we want dg >= threshold (less negative is better)
+    return (
+        dgs["dg_hp_left"]   >= th_hp and
+        dgs["dg_hp_right"]  >= th_hp and
+        dgs["dg_self_left"] >= th_self and
+        dgs["dg_self_right"]>= th_self and
+        dgs["dg_hetero"]    >= th_hetero
+    )
+
+def _kmer_uniqueness_3p(primer: str, seqs: List[Dict], k: int = 11) -> int:
+    """Count exact matches of the 3'-terminal k-mer across all sequences (both strands). Lower is better."""
+    if not primer or k <= 0 or len(primer) < k:
+        return 0
+    kmer = primer[-k:].upper()
+    rc_kmer = str(Seq(kmer).reverse_complement())
+    count = 0
+    for s in seqs:
+        t = s["seq"]
+        count += t.count(kmer) + t.count(rc_kmer)
+        rc = str(Seq(t).reverse_complement())
+        count += rc.count(kmer) + rc.count(rc_kmer)
+    return count
+
+# ---------- Primer design ----------
+def design_primers_on_region(
+    seq: str,
+    target_start: int,
+    target_len: int,
+    amplicon_min: int,
+    amplicon_opt: int,
+    amplicon_max: int,
+    tm_min: float,
+    tm_opt: float,
+    tm_max: float,
+    gc_min: float,
+    gc_max: float,
+    len_min: int,
+    len_opt: int,
+    len_max: int,
+    mv_mM: float,
+    dv_mM: float,
+    dntp_mM: float,
+    dna_nM: float,
+    num_return: int = 30
+) -> List[Dict]:
     seq = sanitize_dna(seq)
     if not seq:
         return []
-    if target_len is None or target_len <= 0 or target_len > len(seq):
-        target_len = len(seq)
+    target_len = max(1, min(len(seq), target_len or len(seq)))
+
     params = {
         'SEQUENCE_ID': 'target',
         'SEQUENCE_TEMPLATE': seq,
@@ -408,20 +530,25 @@ def design_primers_on_region(seq: str, target_start: int = 0, target_len: int = 
         'PRIMER_TASK': 'generic',
         'PRIMER_PICK_LEFT_PRIMER': 1,
         'PRIMER_PICK_RIGHT_PRIMER': 1,
-        'PRIMER_OPT_SIZE': 20,
-        'PRIMER_MIN_SIZE': 18,
-        'PRIMER_MAX_SIZE': 26,
+        'PRIMER_MIN_SIZE': len_min,
+        'PRIMER_OPT_SIZE': len_opt,
+        'PRIMER_MAX_SIZE': len_max,
         'PRIMER_PRODUCT_SIZE_RANGE': [[amplicon_min, amplicon_max]],
         'PRIMER_PRODUCT_OPT_SIZE': amplicon_opt,
         'PRIMER_MIN_TM': tm_min, 'PRIMER_OPT_TM': tm_opt, 'PRIMER_MAX_TM': tm_max,
         'PRIMER_MIN_GC': gc_min, 'PRIMER_MAX_GC': gc_max,
-        'PRIMER_MAX_POLY_X': 4,
+        'PRIMER_MAX_POLY_X': 100,  # we enforce homopolymers custom per-base (A/T vs G/C)
         'PRIMER_MAX_SELF_ANY_TH': 45.0,
         'PRIMER_MAX_SELF_END_TH': 35.0,
         'PRIMER_MAX_HAIRPIN_TH': 24.0,
         'PRIMER_NUM_RETURN': int(num_return),
+
+        # Thermo environment
+        'PRIMER_SALT_MONOVALENT': mv_mM,
+        'PRIMER_SALT_DIVALENT': dv_mM,
+        'PRIMER_DNTP_CONC': dntp_mM,
+        'PRIMER_DNA_CONC': dna_nM,
     }
-    # Updated function name to avoid deprecation warning
     res = primer3.bindings.design_primers(params, opts)
     out = []
     n = res.get('PRIMER_PAIR_NUM_RETURNED', 0)
@@ -435,24 +562,16 @@ def design_primers_on_region(seq: str, target_start: int = 0, target_len: int = 
             'tm_right': round(res.get(f'PRIMER_RIGHT_{i}_TM', 0.0), 2),
             'gc_left': round(res.get(f'PRIMER_LEFT_{i}_GC_PERCENT', 0.0), 1),
             'gc_right': round(res.get(f'PRIMER_RIGHT_{i}_GC_PERCENT', 0.0), 1),
+            'len_left': left_len,
+            'len_right': right_len,
             'amplicon_len': res.get(f'PRIMER_PAIR_{i}_PRODUCT_SIZE'),
             'penalty': round(res.get(f'PRIMER_PAIR_{i}_PENALTY', 0.0), 2),
             'left_pos': left_pos,
-            'left_len': left_len,
             'right_pos': right_pos,
-            'right_len': right_len,
         })
     out = [r for r in out if r['left'] and r['right']]
     out.sort(key=lambda r: (r['penalty'], abs((r['amplicon_len'] or amplicon_opt) - amplicon_opt)))
     return out
-
-def _match_allow_mismatch(primer: str, template: str, max_mismatch=1):
-    if not primer or not template or len(primer) != len(template):
-        return False
-    if primer[-1] != template[-1]:
-        return False
-    mism = sum(1 for a,b in zip(primer, template) if a != b)
-    return mism <= max_mismatch
 
 def insilico_coverage(primer_left: str, primer_right: str, seqs, max_mismatch=1):
     if not seqs:
@@ -464,17 +583,27 @@ def insilico_coverage(primer_left: str, primer_right: str, seqs, max_mismatch=1)
         t = s["seq"]
         if len(t) < 80:
             continue
+        # forward primer
         found_left = False
         for i in range(0, len(t)-len(left)+1):
-            if _match_allow_mismatch(left, t[i:i+len(left)], max_mismatch=max_mismatch):
+            seg = t[i:i+len(left)]
+            if seg[-1] != left[-1]:  # 3' protection
+                continue
+            mism = sum(1 for a,b in zip(left, seg) if a != b)
+            if mism <= max_mismatch:
                 found_left = True
                 break
         if not found_left:
             continue
+        # reverse primer on reverse complement
         rc = str(Seq(t).reverse_complement())
         found_right = False
         for i in range(0, len(rc)-len(right)+1):
-            if _match_allow_mismatch(right, rc[i:i+len(right)], max_mismatch=max_mismatch):
+            seg = rc[i:i+len(right)]
+            if seg[-1] != right[-1]:
+                continue
+            mism = sum(1 for a,b in zip(right, seg) if a != b)
+            if mism <= max_mismatch:
                 found_right = True
                 break
         if found_left and found_right:
@@ -484,7 +613,6 @@ def insilico_coverage(primer_left: str, primer_right: str, seqs, max_mismatch=1)
     return {"hits": hits, "total": total, "pct": pct}
 
 # === Visualization helpers ===
-
 def _encode_fig_to_b64(fig, dpi=140):
     buf = BytesIO()
     fig.savefig(buf, format="png", dpi=dpi, bbox_inches="tight")
@@ -493,13 +621,6 @@ def _encode_fig_to_b64(fig, dpi=140):
     return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
 
 def make_entropy_plot(seqs, designed, locus: str):
-    """
-    Entropy bars with:
-      - x ticks every 50 bp
-      - labeled primer overlays (green/red arrows)
-      - shaded amplicon
-      - codon/AA track for coding loci (triplet aligned, AA labels every 9 bases)
-    """
     if not seqs:
         return None
     ent = entropy_series(seqs)
@@ -518,9 +639,9 @@ def make_entropy_plot(seqs, designed, locus: str):
     # Overlays: up to 5 candidates with labels
     for idx, d in enumerate((designed or [])[:5], start=1):
         lp = d.get("left_pos", 0)
-        ll = d.get("left_len", 0)
+        ll = d.get("len_left", 0)
         rp = d.get("right_pos", 0)
-        rl = d.get("right_len", 0)
+        rl = d.get("len_right", 0)
         amp = d.get("amplicon_len", None)
 
         # forward primer arrow + label
@@ -531,7 +652,7 @@ def make_entropy_plot(seqs, designed, locus: str):
         ax.text(lp, -0.12, f"P{idx} F", color="#22c55e", fontsize=8,
                 ha="left", va="top", transform=ax.get_xaxis_transform())
 
-        # reverse primer arrow + label (from right inward)
+        # reverse primer arrow + label
         ax.annotate("",
             xy=(rp, -0.10), xycoords=("data","axes fraction"),
             xytext=(rp + rl, -0.10), textcoords=("data","axes fraction"),
@@ -554,16 +675,12 @@ def make_entropy_plot(seqs, designed, locus: str):
         ref = seqs[0]["seq"][:(L//3)*3]
         aa = str(Seq(ref).translate())
         codons = len(ref) // 3
-
-        # draw baseline and tick marks every codon
         yline = -0.28
         ax.text(0, yline+0.02, "AA:", transform=ax.transAxes, fontsize=8,
                 color="#94a3b8", ha="left", va="top")
         for i in range(codons+1):
             bp = i * 3
             ax.axvline(bp, ymin=0, ymax=0.02, color="#94a3b833", lw=0.8)
-
-        # label AA every 3rd codon (every 9 bp) to reduce clutter
         for i in range(0, codons, 3):
             bp = i * 3 + 1
             ax.text(bp, -0.34, aa[i], transform=ax.get_xaxis_transform(),
@@ -573,13 +690,12 @@ def make_entropy_plot(seqs, designed, locus: str):
     return _encode_fig_to_b64(fig)
 
 def make_logo_plot(seqs):
-    """Sequence logo (optional). We keep this as a toggle for users; entropy is the default."""
     if not HAS_LOGOMAKER or not seqs:
         return None
     L = min(len(s["seq"]) for s in seqs)
     if L == 0: return None
     counts = pd.DataFrame(0, index=list("ACGT"), columns=range(L))
-    for s in seqs[:200]:  # cap for clarity
+    for s in seqs[:200]:
         for i, b in enumerate(s["seq"][:L]):
             if b in "ACGT":
                 counts.at[b, i] += 1
@@ -590,7 +706,7 @@ def make_logo_plot(seqs):
     ax.set_xticks(np.arange(0, L+1, 50))
     ax.set_xlabel("Position (bp)")
     ax.set_ylabel("Bits")
-    ax.set_ylim(0, 2)  # Max info for DNA
+    ax.set_ylim(0, 2)
     ax.grid(axis='y', alpha=0.15)
     fig.tight_layout()
     return _encode_fig_to_b64(fig)
@@ -807,8 +923,21 @@ def designer():
         "goal": "metabarcoding",
         "platform": "Illumina PE250",
         "amp_min": 120, "amp_opt": 160, "amp_max": 320,
-        "tm_min": 58, "tm_opt": 60, "tm_max": 62,
-        "gc_min": 40, "gc_max": 60,
+        "tm_min": 58.0, "tm_opt": 60.0, "tm_max": 62.0,
+        "gc_min": 40.0, "gc_max": 60.0,
+        "len_min": 18, "len_opt": 20, "len_max": 26,
+
+        # NEW: constraints & thermo
+        "enforce_gc_clamp": "on",
+        "min_gc3": 1, "max_gc3": 2,
+        "max_run_at": 4, "max_run_gc": 4,
+        "max_dinuc": 3,
+        "dg_hp_min": -2.0, "dg_self_min": -6.0, "dg_hetero_min": -7.0,
+        "mv_mM": 50.0, "dv_mM": 1.5, "dntp_mM": 0.2, "dna_nM": 250.0,
+
+        # NEW: k-mer uniqueness
+        "kmer_len": 11, "kmer_max_hits": 1,
+
         "taxon": "", "locus": "COI",
         "source": "ncbi",
         "max_seqs": 100,
@@ -822,24 +951,49 @@ def designer():
 
 @app.post("/designer/run")
 def designer_run():
-    form = request.form
-    goal = form.get("goal") or "metabarcoding"
-    platform = form.get("platform") or "Illumina PE250"
-    amp_min = int(form.get("amp_min") or 120)
-    amp_opt = int(form.get("amp_opt") or 160)
-    amp_max = int(form.get("amp_max") or 320)
-    tm_min = float(form.get("tm_min") or 58)
-    tm_opt = float(form.get("tm_opt") or 60)
-    tm_max = float(form.get("tm_max") or 62)
-    gc_min = float(form.get("gc_min") or 40)
-    gc_max = float(form.get("gc_max") or 60)
-    taxon = (form.get("taxon") or "").strip()
-    locus = (form.get("locus") or "COI").strip()
-    source = form.get("source") or "ncbi"
-    max_seqs = int(form.get("max_seqs") or 100)
-    viz = form.get("viz") or "entropy"
+    f = request.form
 
-    seqs = []
+    goal = f.get("goal") or "metabarcoding"
+    platform = f.get("platform") or "Illumina PE250"
+    amp_min = int(f.get("amp_min") or 120)
+    amp_opt = int(f.get("amp_opt") or 160)
+    amp_max = int(f.get("amp_max") or 320)
+    tm_min = float(f.get("tm_min") or 58)
+    tm_opt = float(f.get("tm_opt") or 60)
+    tm_max = float(f.get("tm_max") or 62)
+    gc_min = float(f.get("gc_min") or 40)
+    gc_max = float(f.get("gc_max") or 60)
+    len_min = int(f.get("len_min") or 18)
+    len_opt = int(f.get("len_opt") or 20)
+    len_max = int(f.get("len_max") or 26)
+
+    enforce_gc_clamp = f.get("enforce_gc_clamp") == "on"
+    min_gc3 = int(f.get("min_gc3") or 1)
+    max_gc3 = int(f.get("max_gc3") or 2)
+    max_run_at = int(f.get("max_run_at") or 4)
+    max_run_gc = int(f.get("max_run_gc") or 4)
+    max_dinuc = int(f.get("max_dinuc") or 3)
+
+    dg_hp_min = float(f.get("dg_hp_min") or -2.0)
+    dg_self_min = float(f.get("dg_self_min") or -6.0)
+    dg_hetero_min = float(f.get("dg_hetero_min") or -7.0)
+
+    mv_mM = float(f.get("mv_mM") or 50.0)
+    dv_mM = float(f.get("dv_mM") or 1.5)
+    dntp_mM = float(f.get("dntp_mM") or 0.2)
+    dna_nM = float(f.get("dna_nM") or 250.0)
+
+    kmer_len = int(f.get("kmer_len") or 11)
+    kmer_max_hits = int(f.get("kmer_max_hits") or 1)
+
+    taxon = (f.get("taxon") or "").strip()
+    locus = (f.get("locus") or "COI").strip()
+    source = f.get("source") or "ncbi"
+    max_seqs = int(f.get("max_seqs") or 100)
+    viz = f.get("viz") or "entropy"
+
+    # Load sequences
+    seqs: List[Dict] = []
     warning = None
     error = None
     if source == "ncbi":
@@ -850,13 +1004,13 @@ def designer_run():
         except Exception as e:
             error = f"NCBI fetch error: {e}"
     elif source == "paste":
-        seqs = parse_fasta_string(form.get("fasta_text") or "")
+        seqs = parse_fasta_string(f.get("fasta_text") or "")
         if not seqs:
             warning = "No sequences parsed from pasted text."
     else:
-        f = request.files.get("fasta_file")
-        if f and f.filename:
-            data = f.read().decode("utf-8", errors="ignore")
+        file = request.files.get("fasta_file")
+        if file and file.filename:
+            data = file.read().decode("utf-8", errors="ignore")
             seqs = parse_fasta_string(data)
         if not seqs:
             warning = "No sequences parsed from uploaded file."
@@ -871,9 +1025,37 @@ def designer_run():
             ref_seq, 0, len(ref_seq),
             amplicon_min=amp_min, amplicon_opt=amp_opt, amplicon_max=amp_max,
             tm_min=tm_min, tm_opt=tm_opt, tm_max=tm_max,
-            gc_min=gc_min, gc_max=gc_max, num_return=30
+            gc_min=gc_min, gc_max=gc_max,
+            len_min=len_min, len_opt=len_opt, len_max=len_max,
+            mv_mM=mv_mM, dv_mM=dv_mM, dntp_mM=dntp_mM, dna_nM=dna_nM,
+            num_return=30
         )
-        for d in designed[:10]:
+
+        # Per-primer QC + coverage + k-mer uniqueness
+        for d in designed:
+            # GC clamp
+            gc3_f, ok_gc3_f = _gc_clamp_ok(d["left"], min_gc3, max_gc3)
+            gc3_r, ok_gc3_r = _gc_clamp_ok(d["right"], min_gc3, max_gc3)
+            d["gc3_f"] = gc3_f; d["gc3_r"] = gc3_r
+            d["gc3_ok"] = (ok_gc3_f and ok_gc3_r) if enforce_gc_clamp else True
+
+            # Homopolymers & dinucleotides
+            d["homopoly_ok_f"] = _homopolymer_ok(d["left"], max_run_at, max_run_gc)
+            d["homopoly_ok_r"] = _homopolymer_ok(d["right"], max_run_at, max_run_gc)
+            d["dinuc_ok_f"] = _dinuc_ok(d["left"], max_dinuc)
+            d["dinuc_ok_r"] = _dinuc_ok(d["right"], max_dinuc)
+
+            # Thermo ΔG
+            dgs = _thermo_dGs(d["left"], d["right"], mv_mM, dv_mM, dntp_mM, dna_nM)
+            d.update(dgs)
+            d["dg_ok"] = _dG_pass(dgs, dg_hp_min, dg_self_min, dg_hetero_min)
+
+            # 3'-end uniqueness
+            d["kmer_hits_f"] = _kmer_uniqueness_3p(d["left"], seqs, k=kmer_len)
+            d["kmer_hits_r"] = _kmer_uniqueness_3p(d["right"], seqs, k=kmer_len)
+            d["kmer_ok"] = (d["kmer_hits_f"] <= kmer_max_hits) and (d["kmer_hits_r"] <= kmer_max_hits)
+
+            # Coverage across pulled sequences
             cov = insilico_coverage(d["left"], d["right"], seqs, max_mismatch=1)
             d["coverage_pct"] = cov["pct"]
             d["coverage_hits"] = cov["hits"]
@@ -883,7 +1065,6 @@ def designer_run():
         entropy_png = make_entropy_plot(seqs[:50], designed, locus=locus)
         if HAS_LOGOMAKER:
             logo_png = make_logo_plot(seqs[:200])
-
     else:
         warning = warning or "No reference sequence available to design primers."
 
@@ -892,6 +1073,17 @@ def designer_run():
         "amp_min": amp_min, "amp_opt": amp_opt, "amp_max": amp_max,
         "tm_min": tm_min, "tm_opt": tm_opt, "tm_max": tm_max,
         "gc_min": gc_min, "gc_max": gc_max,
+        "len_min": len_min, "len_opt": len_opt, "len_max": len_max,
+
+        "enforce_gc_clamp": "on" if enforce_gc_clamp else "",
+        "min_gc3": min_gc3, "max_gc3": max_gc3,
+        "max_run_at": max_run_at, "max_run_gc": max_run_gc,
+        "max_dinuc": max_dinuc,
+        "dg_hp_min": dg_hp_min, "dg_self_min": dg_self_min, "dg_hetero_min": dg_hetero_min,
+        "mv_mM": mv_mM, "dv_mM": dv_mM, "dntp_mM": dntp_mM, "dna_nM": dna_nM,
+
+        "kmer_len": kmer_len, "kmer_max_hits": kmer_max_hits,
+
         "taxon": taxon, "locus": locus,
         "source": source, "max_seqs": max_seqs,
         "viz": viz,
@@ -933,7 +1125,6 @@ def designer_blast():
 
 @app.post("/designer/export/csv")
 def designer_export_csv():
-    import json
     designed_json = request.form.get("designed_json") or "[]"
     try:
         designed = pd.DataFrame(json.loads(designed_json))
