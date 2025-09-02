@@ -494,7 +494,101 @@ def _kmer_uniqueness_3p(primer: str, seqs: List[Dict], k: int = 11) -> int:
         count += rc.count(kmer) + rc.count(rc_kmer)
     return count
 
-# ---------- Primer design ----------
+# --- Region constraints from entropy (auto windows) ---
+def _ok_region_pairs_from_entropy(seqs: List[Dict], f_span: int = 60, r_span: int = 60,
+                                  max_entropy: float = 0.6, max_pairs: int = 4) -> Optional[str]:
+    """Build SEQUENCE_PRIMER_PAIR_OK_REGION_LIST from low-entropy windows.
+       Forward windows taken from first ~40% of alignment, reverse from last ~60%."""
+    if not seqs:
+        return None
+    ent = entropy_series(seqs)
+    if not ent:
+        return None
+    L = len(ent)
+    if L < (f_span + r_span + 10):
+        return None
+
+    import numpy as np
+    ent_arr = np.array(ent, dtype=float)
+
+    # scan windows
+    def scan_windows(start, end, span):
+        best = []
+        for i in range(start, max(start, end - span + 1)):
+            w = ent_arr[i:i+span]
+            if len(w) < span:
+                break
+            m = float(w.mean())
+            best.append((m, i))
+        best.sort(key=lambda x: (x[0], x[1]))
+        return best
+
+    # choose zones
+    f_end = int(L * 0.45)
+    r_start = int(L * 0.35)
+    f_cands = scan_windows(0, f_end, f_span)[:max_pairs * 2]
+    r_cands = scan_windows(r_start, L - r_span, r_span)[:max_pairs * 2]
+
+    # filter by entropy threshold if possible
+    f_cands = [c for c in f_cands if c[0] <= max_entropy] or f_cands
+    r_cands = [c for c in r_cands if c[0] <= max_entropy] or r_cands
+
+    pairs = []
+    for i, (_, f_pos) in enumerate(f_cands[:max_pairs]):
+        if i >= len(r_cands):
+            break
+        _, r_pos = r_cands[i]
+        pairs.append(f"{f_pos},{f_span},{r_pos},{r_span}")
+
+    return " ".join(pairs) if pairs else None
+
+# ---------- Primer design (enhanced) ----------
+def _pairwise_combine_from_lists(res: Dict, amp_min: int, amp_max: int, amplicon_opt: int) -> List[Dict]:
+    """When PRIMER_TASK=pick_primer_list, pair left/right lists greedily."""
+    out = []
+    nL = int(res.get("PRIMER_LEFT_NUM_RETURNED", 0) or 0)
+    nR = int(res.get("PRIMER_RIGHT_NUM_RETURNED", 0) or 0)
+    lefts = []
+    rights = []
+    for i in range(nL):
+        pos, ln = res.get(f"PRIMER_LEFT_{i}", [None, None])
+        seq = res.get(f"PRIMER_LEFT_{i}_SEQUENCE")
+        if seq and pos is not None:
+            lefts.append({
+                "idx": i, "pos": pos, "len": ln, "seq": seq,
+                "tm": res.get(f"PRIMER_LEFT_{i}_TM", 0.0),
+                "gc": res.get(f"PRIMER_LEFT_{i}_GC_PERCENT", 0.0)
+            })
+    for j in range(nR):
+        pos, ln = res.get(f"PRIMER_RIGHT_{j}", [None, None])
+        seq = res.get(f"PRIMER_RIGHT_{j}_SEQUENCE")
+        if seq and pos is not None:
+            rights.append({
+                "idx": j, "pos": pos, "len": ln, "seq": seq,
+                "tm": res.get(f"PRIMER_RIGHT_{j}_TM", 0.0),
+                "gc": res.get(f"PRIMER_RIGHT_{j}_GC_PERCENT", 0.0)
+            })
+    # greedy pairing: for each left, find a right that yields a plausible product
+    for L in lefts:
+        for R in rights:
+            # Primer3 stores RIGHT position as the 3' index from leftmost base.
+            # Approximate product size:
+            prod = (R["pos"] - L["pos"]) + 1
+            if prod < amp_min or prod > amp_max:
+                continue
+            out.append({
+                'left': L["seq"], 'right': R["seq"],
+                'tm_left': round(L["tm"], 2), 'tm_right': round(R["tm"], 2),
+                'gc_left': round(L["gc"], 1), 'gc_right': round(R["gc"], 1),
+                'len_left': L["len"], 'len_right': R["len"],
+                'amplicon_len': prod, 'penalty': 0.0,
+                'left_pos': L["pos"], 'right_pos': R["pos"]
+            })
+    # rank by distance to optimal product and balance of Tm
+    out.sort(key=lambda r: (abs((r['amplicon_len'] or amplicon_opt) - amplicon_opt),
+                            abs(r['tm_left'] - r['tm_right'])))
+    return out[:300]
+
 def design_primers_on_region(
     seq: str,
     target_start: int,
@@ -514,7 +608,10 @@ def design_primers_on_region(
     dv_mM: float,
     dntp_mM: float,
     dna_nM: float,
-    num_return: int = 30
+    num_return: int = 30,
+    candidate_mode: str = "pairs",             # "pairs" or "list"
+    min_three_prime_dist: int = 5,
+    ok_region_pairs: Optional[str] = None      # "fstart,flen,rstart,rlen ..." (Primer3 format)
 ) -> List[Dict]:
     seq = sanitize_dna(seq)
     if not seq:
@@ -527,7 +624,7 @@ def design_primers_on_region(
         'SEQUENCE_TARGET': [target_start, target_len],
     }
     opts = {
-        'PRIMER_TASK': 'generic',
+        'PRIMER_TASK': 'generic' if candidate_mode == "pairs" else 'pick_primer_list',
         'PRIMER_PICK_LEFT_PRIMER': 1,
         'PRIMER_PICK_RIGHT_PRIMER': 1,
         'PRIMER_MIN_SIZE': len_min,
@@ -540,8 +637,17 @@ def design_primers_on_region(
         'PRIMER_MAX_POLY_X': 100,  # we enforce homopolymers custom per-base (A/T vs G/C)
         'PRIMER_MAX_SELF_ANY_TH': 45.0,
         'PRIMER_MAX_SELF_END_TH': 35.0,
-        'PRIMER_MAX_HAIRPIN_TH': 24.0,
+        'PRIMER_MAX_HAIRPIN_TH': 47.0,
         'PRIMER_NUM_RETURN': int(num_return),
+
+        # enforce uniqueness/spacing at 3' ends (reduces near-duplicate pairs)
+        'PRIMER_MIN_THREE_PRIME_DISTANCE': int(min_three_prime_dist),
+
+        # Avoid Ns in primer sequence
+        'PRIMER_MAX_NS_ACCEPTED': 0,
+
+        # Explanation flags
+        'PRIMER_EXPLAIN_FLAG': 1,
 
         # Thermo environment
         'PRIMER_SALT_MONOVALENT': mv_mM,
@@ -549,7 +655,15 @@ def design_primers_on_region(
         'PRIMER_DNTP_CONC': dntp_mM,
         'PRIMER_DNA_CONC': dna_nM,
     }
+    if ok_region_pairs:
+        opts['SEQUENCE_PRIMER_PAIR_OK_REGION_LIST'] = ok_region_pairs
+
     res = primer3.bindings.design_primers(params, opts)
+
+    if candidate_mode == "list":
+        return _pairwise_combine_from_lists(res, amplicon_min, amplicon_max, amplicon_opt)
+
+    # default: paired output from Primer3 (generic)
     out = []
     n = res.get('PRIMER_PAIR_NUM_RETURNED', 0)
     for i in range(n):
@@ -938,6 +1052,11 @@ def designer():
         # NEW: k-mer uniqueness
         "kmer_len": 11, "kmer_max_hits": 1,
 
+        # NEW: candidate list vs pairs & region constraints
+        "candidate_mode": "pairs",        # "pairs" or "list"
+        "region_mode": "none",            # "none" or "auto"
+        "min_three_prime_dist": 5,
+
         "taxon": "", "locus": "COI",
         "source": "ncbi",
         "max_seqs": 100,
@@ -986,6 +1105,10 @@ def designer_run():
     kmer_len = int(f.get("kmer_len") or 11)
     kmer_max_hits = int(f.get("kmer_max_hits") or 1)
 
+    candidate_mode = f.get("candidate_mode") or "pairs"       # <-- NEW
+    region_mode = f.get("region_mode") or "none"              # <-- NEW
+    min_three_prime_dist = int(f.get("min_three_prime_dist") or 5)
+
     taxon = (f.get("taxon") or "").strip()
     locus = (f.get("locus") or "COI").strip()
     source = f.get("source") or "ncbi"
@@ -1019,6 +1142,12 @@ def designer_run():
     designed = []
     entropy_png = None
     logo_png = None
+    ok_region_pairs = None
+
+    # Optional region constraints (auto windows from entropy)
+    if ref_seq and region_mode == "auto":
+        ok_region_pairs = _ok_region_pairs_from_entropy(seqs, f_span=60, r_span=60,
+                                                        max_entropy=0.6, max_pairs=4)
 
     if ref_seq:
         designed = design_primers_on_region(
@@ -1028,7 +1157,10 @@ def designer_run():
             gc_min=gc_min, gc_max=gc_max,
             len_min=len_min, len_opt=len_opt, len_max=len_max,
             mv_mM=mv_mM, dv_mM=dv_mM, dntp_mM=dntp_mM, dna_nM=dna_nM,
-            num_return=30
+            num_return=200 if candidate_mode == "list" else 60,
+            candidate_mode=candidate_mode,
+            min_three_prime_dist=min_three_prime_dist,
+            ok_region_pairs=ok_region_pairs
         )
 
         # Per-primer QC + coverage + k-mer uniqueness
@@ -1084,6 +1216,10 @@ def designer_run():
 
         "kmer_len": kmer_len, "kmer_max_hits": kmer_max_hits,
 
+        "candidate_mode": candidate_mode,
+        "region_mode": region_mode,
+        "min_three_prime_dist": min_three_prime_dist,
+
         "taxon": taxon, "locus": locus,
         "source": source, "max_seqs": max_seqs,
         "viz": viz,
@@ -1094,6 +1230,7 @@ def designer_run():
     }
     return render_template("designer.html", **ctx)
 
+# ---- Primer BLAST helper (unchanged) ----
 @app.post("/designer/blast")
 def designer_blast():
     primer = (request.form.get("primer") or "").strip().upper()
@@ -1123,6 +1260,115 @@ def designer_blast():
     except Exception as e:
         return (f"BLAST failed: {e}", 500)
 
+# ---- NEW: Check user-supplied primers with Primer3 thermo ----
+@app.post("/designer/check")
+def designer_check():
+    left = sanitize_dna(request.form.get("left") or "")
+    right = sanitize_dna(request.form.get("right") or "")
+    template = sanitize_dna(request.form.get("template") or "")
+    if not left or not right:
+        return ("Need left and right primers.", 400)
+
+    mv_mM = float(request.form.get("mv_mM") or 50.0)
+    dv_mM = float(request.form.get("dv_mM") or 1.5)
+    dntp_mM = float(request.form.get("dntp_mM") or 0.2)
+    dna_nM = float(request.form.get("dna_nM") or 250.0)
+
+    params = {'SEQUENCE_ID': 'user', 'PRIMER_LEFT_INPUT': left, 'PRIMER_RIGHT_INPUT': right}
+    if template:
+        params['SEQUENCE_TEMPLATE'] = template
+
+    opts = {
+        'PRIMER_TASK': 'check_primers',
+        'PRIMER_EXPLAIN_FLAG': 1,
+        'PRIMER_SALT_MONOVALENT': mv_mM,
+        'PRIMER_SALT_DIVALENT': dv_mM,
+        'PRIMER_DNTP_CONC': dntp_mM,
+        'PRIMER_DNA_CONC': dna_nM,
+    }
+
+    try:
+        res = primer3.bindings.design_primers(params, opts)
+        tmL = round(res.get('PRIMER_LEFT_0_TM', 0.0), 2)
+        tmR = round(res.get('PRIMER_RIGHT_0_TM', 0.0), 2)
+        anyL = round(res.get('PRIMER_LEFT_0_SELF_ANY_TH', 0.0), 2)
+        endL = round(res.get('PRIMER_LEFT_0_SELF_END_TH', 0.0), 2)
+        anyR = round(res.get('PRIMER_RIGHT_0_SELF_ANY_TH', 0.0), 2)
+        endR = round(res.get('PRIMER_RIGHT_0_SELF_END_TH', 0.0), 2)
+        het  = round(res.get('PRIMER_PAIR_0_COMPL_ANY_TH', 0.0), 2)
+        hetE = round(res.get('PRIMER_PAIR_0_COMPL_END_TH', 0.0), 2)
+
+        html = f"""
+        <div class='p-2 text-sm'>
+          <div><b>Tm</b> — Left: {tmL}°C, Right: {tmR}°C</div>
+          <div><b>Self-dimer (ANY/END)</b> — Left: {anyL}/{endL}, Right: {anyR}/{endR}</div>
+          <div><b>Hetero-dimer (ANY/END)</b> — Pair: {het}/{hetE}</div>
+        </div>
+        """
+        resp = make_response(html)
+        resp.headers["Content-Type"] = "text/html; charset=utf-8"
+        return resp
+    except Exception as e:
+        return (f"Check failed: {e}", 500)
+
+# ---- NEW: Settings export/import (reproducibility) ----
+def _collect_primer3_settings(form) -> Dict[str, str]:
+    keys = {
+        "PRIMER_MIN_SIZE": "len_min",
+        "PRIMER_OPT_SIZE": "len_opt",
+        "PRIMER_MAX_SIZE": "len_max",
+        "PRIMER_PRODUCT_OPT_SIZE": "amp_opt",
+        "PRIMER_MIN_TM": "tm_min",
+        "PRIMER_OPT_TM": "tm_opt",
+        "PRIMER_MAX_TM": "tm_max",
+        "PRIMER_MIN_GC": "gc_min",
+        "PRIMER_MAX_GC": "gc_max",
+        "PRIMER_SALT_MONOVALENT": "mv_mM",
+        "PRIMER_SALT_DIVALENT": "dv_mM",
+        "PRIMER_DNTP_CONC": "dntp_mM",
+        "PRIMER_DNA_CONC": "dna_nM",
+        "PRIMER_MIN_THREE_PRIME_DISTANCE": "min_three_prime_dist",
+        "PRIMER_MAX_NS_ACCEPTED": None,  # fixed at 0 in code (sane default)
+    }
+    out = {}
+    for k, fkey in keys.items():
+        if fkey and (fkey in form):
+            out[k] = str(form.get(fkey))
+    out["PRIMER_MAX_NS_ACCEPTED"] = "0"
+    return out
+
+@app.post("/designer/settings/export")
+def settings_export():
+    s = _collect_primer3_settings(request.form)
+    lines = [f"{k}={v}" for k,v in s.items()]
+    payload = "\n".join(lines).encode("utf-8")
+    resp = make_response(payload)
+    resp.headers["Content-Type"] = "text/plain; charset=utf-8"
+    resp.headers["Content-Disposition"] = 'attachment; filename="primer3_settings.prm"'
+    return resp
+
+@app.post("/designer/settings/import")
+def settings_import():
+    file = request.files.get("settings_file")
+    if not file or not file.filename:
+        return ("No settings file uploaded.", 400)
+    try:
+        text = file.read().decode("utf-8", errors="ignore")
+        cfg = {}
+        for line in text.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            cfg[k.strip()] = v.strip()
+        # Return JSON for your front-end to map back into fields
+        resp = make_response(json.dumps(cfg))
+        resp.headers["Content-Type"] = "application/json"
+        return resp
+    except Exception as e:
+        return (f"Failed to parse settings: {e}", 400)
+
+# ---- Designer CSV export (unchanged) ----
 @app.post("/designer/export/csv")
 def designer_export_csv():
     designed_json = request.form.get("designed_json") or "[]"
@@ -1139,5 +1385,148 @@ def designer_export_csv():
     return resp
 
 # ----------------------------------------------------------------
+@app.get("/healthz")
+def healthz():
+    return "ok", 200
+
+# ----------------------------------------------------------------
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, debug=True)
+
+
+# === Injected API routes for Vercel proxy ===
+
+# ---------- Health ----------
+@app.get("/health")
+def health():
+    return jsonify(ok=True)
+
+# ---------- Primer design API ----------
+@app.post("/api/primers")
+def api_primers():
+    """
+    JSON:
+    {
+      "sequence": "ACGT...",
+      "params": {...}   # optional primer3 global params
+    }
+    """
+    try:
+        data = request.get_json(force=True, silent=False) or {}
+        seq = (data.get("sequence") or "").strip().upper()
+        if not seq or set(seq) - set("ACGTN"):
+            return jsonify(ok=False, error="Provide a DNA sequence (ACGTN) in 'sequence'"), 400
+
+        # Default primer3 settings (tuned minimal; you can expand later)
+        global_args = {
+            'PRIMER_OPT_SIZE': 20,
+            'PRIMER_MIN_SIZE': 18,
+            'PRIMER_MAX_SIZE': 25,
+            'PRIMER_OPT_TM': 60.0,
+            'PRIMER_MIN_TM': 57.0,
+            'PRIMER_MAX_TM': 63.0,
+            'PRIMER_MAX_POLY_X': 4,
+            'PRIMER_GC_CLAMP': 1,
+            'PRIMER_NUM_RETURN': 5,
+        }
+        # Allow overrides
+        user_params = data.get("params") or {}
+        for k,v in user_params.items():
+            global_args[str(k)] = v
+
+        seq_args = {
+            'SEQUENCE_ID': 'template',
+            'SEQUENCE_TEMPLATE': seq,
+        }
+
+        primers = []
+        # primer3 may not be installed in all environments; guard it.
+        try:
+            res = primer3.bindings.designPrimers(seq_args, global_args)
+            n = int(res.get('PRIMER_PAIR_NUM_RETURNED', 0) or 0)
+            for i in range(n):
+                primers.append({
+                    "left_seq": res.get(f"PRIMER_LEFT_{i}_SEQUENCE"),
+                    "right_seq": res.get(f"PRIMER_RIGHT_{i}_SEQUENCE"),
+                    "left_tm": res.get(f"PRIMER_LEFT_{i}_TM"),
+                    "right_tm": res.get(f"PRIMER_RIGHT_{i}_TM"),
+                    "product_size": res.get(f"PRIMER_PAIR_{i}_PRODUCT_SIZE"),
+                    "pair_penalty": res.get(f"PRIMER_PAIR_{i}_PENALTY"),
+                })
+            payload = {
+                "ok": True,
+                "count": len(primers),
+                "primers": primers,
+                "warnings": res.get("PRIMER_WARNING", ""),
+            }
+        except Exception as e:
+            payload = {"ok": False, "error": f"primer3 error: {e}"}
+        return jsonify(payload)
+    except Exception as e:
+        return jsonify(ok=False, error=str(e)), 500
+
+# ---------- BLAST/NCBI check (stub) ----------
+@app.post("/api/blast")
+def api_blast():
+    """
+    Accepts: { "sequence": "ACGT..." }
+    NOTE: NCBI qblast calls are long-running and often blocked from serverless.
+    This endpoint is a stub; wire your existing BLAST routine here.
+    """
+    try:
+        data = request.get_json(force=True) or {}
+        seq = (data.get("sequence") or "").strip().upper()
+        if not seq:
+            return jsonify(ok=False, error="Missing 'sequence'"), 400
+        # TODO: integrate NCBIWWW.qblast or local BLAST; return basic structure
+        return jsonify(ok=True, hits=[])
+    except Exception as e:
+        return jsonify(ok=False, error=str(e)), 500
+
+# ---------- PDF report ----------
+@app.post("/api/report")
+def api_report():
+    """
+    Accepts: { "title": "Marker Report", "items": [ {...primer pair...} ] }
+    Returns: application/pdf
+    """
+    try:
+        data = request.get_json(force=True) or {}
+        title = data.get("title") or "Marker Finder Report"
+        items = data.get("items") or []
+
+        # Build a tiny PDF
+        from reportlab.lib import colors
+        styles = getSampleStyleSheet()
+        buf = BytesIO()
+        doc = SimpleDocTemplate(buf, pagesize=LETTER, title=title, author="Marker Finder")
+        story = []
+        story.append(Paragraph(title, styles['Title']))
+        story.append(Spacer(1, 12))
+        if items:
+            # table header
+            rows = [["#", "Left", "Right", "Tm L", "Tm R", "Product"]]
+            for i, it in enumerate(items, 1):
+                rows.append([
+                    str(i),
+                    it.get("left_seq",""),
+                    it.get("right_seq",""),
+                    f"{it.get('left_tm','')}"[:6],
+                    f"{it.get('right_tm','')}"[:6],
+                    str(it.get("product_size","")),
+                ])
+            tbl = Table(rows, repeatRows=1)
+            tbl.setStyle(TableStyle([
+                ("BACKGROUND",(0,0),(-1,0), colors.lightgrey),
+                ("GRID",(0,0),(-1,-1), 0.5, colors.grey),
+                ("FONTNAME",(0,0),(-1,0),"Helvetica-Bold"),
+                ("ALIGN",(0,0),(0,-1),"RIGHT"),
+            ]))
+            story.append(tbl)
+        else:
+            story.append(Paragraph("No primer pairs provided.", styles['Normal']))
+        doc.build(story)
+        buf.seek(0)
+        return send_file(buf, mimetype="application/pdf", as_attachment=True, download_name="marker_report.pdf")
+    except Exception as e:
+        return jsonify(ok=False, error=str(e)), 500
