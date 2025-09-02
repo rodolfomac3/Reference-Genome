@@ -1,12 +1,9 @@
 Flask==3.0.3
 python-dotenv==1.0.1
 biopython==1.83
-pandas==2.2.2
 requests==2.32.3
 gunicorn==22.0.0
 reportlab>=4.2.0
 primer3-py>=2.0.1
 logomaker==0.8
-numpy==1.26.4
-matplotlib==3.8.4
 certifi==2024.7.4
