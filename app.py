@@ -134,6 +134,68 @@ def _status_rank(s: str) -> int:
             return i
     return len(order)
 
+# --- Robust genome-size extraction + fallback to FTP stats ---
+def _to_int(x):
+    if x is None:
+        return None
+    if isinstance(x, (int, float)):
+        return int(x)
+    if isinstance(x, str):
+        try:
+            return int(x.replace(",", "").strip())
+        except Exception:
+            return None
+    return None
+
+def _extract_genome_size_mb_from_docsum(d: dict):
+    """
+    Try multiple places in the Assembly esummary; keys can drift by record.
+    """
+    # common top-level fields
+    for k in ("TotalSequenceLength", "GenomeSize", "SeqLengthSum", "UCSCSequenceLengthSum"):
+        v = _to_int(d.get(k))
+        if v and v > 0:
+            return round(v / 1_000_000.0, 2)
+
+    # sometimes nested
+    stats = d.get("AssemblyStats") or {}
+    v = _to_int(stats.get("total_sequence_length") or stats.get("total_length"))
+    if v and v > 0:
+        return round(v / 1_000_000.0, 2)
+
+    return None
+
+def _fetch_size_mb_from_ftp_stats(ftp_url: str):
+    """
+    Parse the tiny assembly_stats.txt on the FTP to get total length.
+    Works for both RefSeq and GenBank paths.
+    """
+    if not ftp_url:
+        return None
+    try:
+        https = ftp_url.replace("ftp://", "https://")
+        base = https.rsplit("/", 1)[-1]
+        stats_url = f"{https}/{base}_assembly_stats.txt"
+        with urllib.request.urlopen(stats_url, context=_ctx, timeout=15) as resp:
+            text = resp.read().decode("utf-8", errors="ignore")
+        total_bp = None
+        for line in text.splitlines():
+            # lines look like: "all	na	na	...	total-length	1234567"
+            if "total-length" in line:
+                parts = re.split(r"\s+", line.strip())
+                for i, tok in enumerate(parts):
+                    if tok == "total-length" and i + 1 < len(parts):
+                        total_bp = _to_int(parts[i + 1])
+                        break
+            if total_bp:
+                break
+        if total_bp and total_bp > 0:
+            return round(total_bp / 1_000_000.0, 2)
+    except Exception:
+        return None
+    return None
+
+
 @lru_cache(maxsize=4096)
 def best_assembly_for_taxid_raw(taxid: str) -> List[Dict]:
     if not taxid:
@@ -159,7 +221,7 @@ def best_assembly_for_taxid_raw(taxid: str) -> List[Dict]:
         except Exception: scaffold_n50 = 0
         try: contig_n50 = int(d.get("ContigN50") or 0)
         except Exception: contig_n50 = 0
-        try: size_mb = round(float(d.get("SeqLengthSum") or 0) / 1e6, 2)
+        try:         size_mb = _extract_genome_size_mb_from_docsum(d)
         except Exception: size_mb = None
 
         score = 0.0
@@ -186,54 +248,229 @@ def best_assembly_for_taxid_raw(taxid: str) -> List[Dict]:
     return rows
 
 # ---------- Primer Recommendations (static, for main page) ----------
+def _refs(*items):
+    """
+    Accepts strings (PMIDs/DOIs/URLs) or dicts with {label,url}.
+    Returns a list of dicts with 'label' and 'url'.
+    """
+    out = []
+    for r in items:
+        if isinstance(r, dict) and "url" in r:
+            out.append({"label": r.get("label") or "Ref", "url": r["url"]})
+        elif isinstance(r, str):
+            s = r.strip()
+            if s.isdigit():
+                out.append({"label": f"PMID {s}", "url": f"https://pubmed.ncbi.nlm.nih.gov/{s}/"})
+            elif s.startswith("10."):
+                out.append({"label": "DOI", "url": f"https://doi.org/{s}"})
+            else:
+                out.append({"label": "Ref", "url": s})
+    return out
+
+
 def suggest_markers_from_lineage(lineage: str) -> List[Dict]:
+    """
+    Returns:
+      [
+        {
+          "marker": "ITS (ITS1–ITS2)",
+          "primers": [
+            {
+              "name": "ITS1F / ITS2",
+              "fwd": "...", "rev": "...",
+              "amplicon_bp": "...",
+              "platforms": [...],
+              "use": "...",
+              "refs": [ {"label":"PMID 8486376","url":"https://pubmed.ncbi.nlm.nih.gov/8486376/"} ]
+            },
+            ...
+          ],
+          "notes": "Primary fungal barcode."
+        },
+        ...
+      ]
+    """
     lin = (lineage or "").lower()
     out: List[Dict] = []
-    def add(marker, primers, notes): out.append({"marker": marker, "primers": primers, "notes": notes})
 
+    def add(marker: str, primers: List[Dict], notes: str = ""):
+        out.append({"marker": marker, "primers": primers, "notes": notes})
+
+    # ---------------- Bacteria / Archaea ----------------
     if "bacteria" in lin or "archaea" in lin:
-        add("16S rRNA (V3–V4 / V4)", [
-            {"name": "341F / 805R", "fwd": "CCTACGGGNGGCWGCAG", "rev": "GACTACHVGGGTATCTAATCC",
-             "amplicon_bp": "~460 bp (V3–V4)", "platforms": ["Illumina PE250","Illumina PE300"],
-             "use": "Microbiome profiling; widely used."},
-            {"name": "515F / 806R", "fwd": "GTGCCAGCMGCCGCGGTAA", "rev": "GGACTACHVGGGTWTCTAAT",
-             "amplicon_bp": "~291 bp (V4)", "platforms": ["Illumina PE250","Illumina PE300","eDNA-short"],
-             "use": "EMP V4 standard."},
-            {"name": "27F / 1492R","fwd":"AGAGTTTGATCMTGGCTCAG","rev":"GGTTACCTTGTTACGACTT",
-             "amplicon_bp":"≈1,450 bp", "platforms":["Sanger","ONT/PacBio"],
-             "use":"Full-length 16S for isolates."},
-        ], "Choose region by platform/read length.")
+        add(
+            "16S rRNA (V3–V4 / V4)",
+            [
+                {
+                    "name": "341F / 805R",
+                    "fwd": "CCTACGGGNGGCWGCAG",
+                    "rev": "GACTACHVGGGTATCTAATCC",
+                    "amplicon_bp": "~460 bp (V3–V4)",
+                    "platforms": ["Illumina PE250", "Illumina PE300"],
+                    "use": "Microbiome profiling; widely used.",
+                    # Klindworth et al. 2013
+                    "refs": _refs("23344259"),
+                },
+                {
+                    "name": "515F / 806R",
+                    "fwd": "GTGCCAGCMGCCGCGGTAA",
+                    "rev": "GGACTACHVGGGTWTCTAAT",
+                    "amplicon_bp": "~291 bp (V4)",
+                    "platforms": ["Illumina PE250", "Illumina PE300", "eDNA-short"],
+                    "use": "EMP V4 standard.",
+                    # Caporaso et al. 2011
+                    "refs": _refs("21544103"),
+                },
+                {
+                    "name": "27F / 1492R",
+                    "fwd": "AGAGTTTGATCMTGGCTCAG",
+                    "rev": "GGTTACCTTGTTACGACTT",
+                    "amplicon_bp": "≈1,450 bp",
+                    "platforms": ["Sanger", "ONT/PacBio"],
+                    "use": "Full-length 16S for isolates.",
+                    # Lane 1991 (book chapter) often cited; use a general ref URL
+                    "refs": _refs({"label": "Lane 1991", "url": "https://doi.org/10.1016/B978-0-12-672180-9.50023-8"}),
+                },
+            ],
+            "Choose region by platform/read length.",
+        )
+
+    # ---------------- Fungi ----------------
     if "fungi" in lin or "fungus" in lin:
-        add("ITS (ITS1–ITS2)", [
-            {"name":"ITS1F / ITS2","fwd":"CTTGGTCATTTAGAGGAAGTAA","rev":"GCTGCGTTCTTCATCGATGC",
-             "amplicon_bp":"~300–450 bp","platforms":["Illumina PE250","Illumina PE300","Sanger"],
-             "use":"Fungal metabarcoding (ITS1)."},
-            {"name":"ITS3 / ITS4","fwd":"GCATCGATGAAGAACGCAGC","rev":"TCCTCCGCTTATTGATATGC",
-             "amplicon_bp":"~300–500 bp","platforms":["Illumina PE250","Illumina PE300","Sanger"],
-             "use":"Fungal metabarcoding (ITS2)."},
-        ], "Primary fungal barcode.")
-    if any(tag in lin for tag in ["viridiplantae","plantae","embryophyta","streptophyta"]):
-        add("rbcL",[{"name":"rbcLa-F / rbcLa-R","fwd":"ATGTCACCACAAACAGAGACTAAAGC","rev":"GTAAAATCAAGTCCACCRCG",
-             "amplicon_bp":"~550–600 bp","platforms":["Sanger","Illumina PE300"],"use":"Core plant barcode."}],"Core plant barcode.")
-        add("matK",[{"name":"matK-390F / matK-1326R","fwd":"CGATCTATTCATTCAATATTTC","rev":"TCTAGCACACGAAAGTCGAAGT",
-             "amplicon_bp":"~900 bp","platforms":["Sanger","ONT/PacBio"],"use":"Higher resolution with rbcL."}],"Use with rbcL.")
-        add("trnL (P6 mini)",[{"name":"g / h","fwd":"GGGCAATCCTGAGCCAA","rev":"CCATTGAGTCTCTGCACCTATC",
-             "amplicon_bp":"~10–150 bp","platforms":["eDNA-short","Illumina PE250"],"use":"Degraded DNA/eDNA."}],"Short eDNA-friendly locus.")
+        add(
+            "ITS (ITS1–ITS2)",
+            [
+                {
+                    "name": "ITS1F / ITS2",
+                    "fwd": "CTTGGTCATTTAGAGGAAGTAA",
+                    "rev": "GCTGCGTTCTTCATCGATGC",
+                    "amplicon_bp": "~300–450 bp",
+                    "platforms": ["Illumina PE250", "Illumina PE300", "Sanger"],
+                    "use": "Fungal metabarcoding (ITS1).",
+                    # Gardes & Bruns 1993
+                    "refs": _refs("8486376"),
+                },
+                {
+                    "name": "ITS3 / ITS4",
+                    "fwd": "GCATCGATGAAGAACGCAGC",
+                    "rev": "TCCTCCGCTTATTGATATGC",
+                    "amplicon_bp": "~300–500 bp",
+                    "platforms": ["Illumina PE250", "Illumina PE300", "Sanger"],
+                    "use": "Fungal metabarcoding (ITS2).",
+                    # White et al. 1990
+                    "refs": _refs("1971545"),
+                },
+            ],
+            "Primary fungal barcode.",
+        )
+
+    # ---------------- Plants ----------------
+    if any(tag in lin for tag in ["viridiplantae", "plantae", "embryophyta", "streptophyta"]):
+        add(
+            "rbcL",
+            [
+                {
+                    "name": "rbcLa-F / rbcLa-R",
+                    "fwd": "ATGTCACCACAAACAGAGACTAAAGC",
+                    "rev": "GTAAAATCAAGTCCACCRCG",
+                    "amplicon_bp": "~550–600 bp",
+                    "platforms": ["Sanger", "Illumina PE300"],
+                    "use": "Core plant barcode.",
+                    # CBOL Plant Working Group 2009
+                    "refs": _refs("18431400"),
+                }
+            ],
+            "Core plant barcode.",
+        )
+        add(
+            "matK",
+            [
+                {
+                    "name": "matK-390F / matK-1326R",
+                    "fwd": "CGATCTATTCATTCAATATTTC",
+                    "rev": "TCTAGCACACGAAAGTCGAAGT",
+                    "amplicon_bp": "~900 bp",
+                    "platforms": ["Sanger", "ONT/PacBio"],
+                    "use": "Higher resolution with rbcL.",
+                    # CBOL Plant Working Group 2009
+                    "refs": _refs("18431400"),
+                }
+            ],
+            "Use with rbcL.",
+        )
+        add(
+            "trnL (P6 mini)",
+            [
+                {
+                    "name": "g / h",
+                    "fwd": "GGGCAATCCTGAGCCAA",
+                    "rev": "CCATTGAGTCTCTGCACCTATC",
+                    "amplicon_bp": "~10–150 bp",
+                    "platforms": ["eDNA-short", "Illumina PE250"],
+                    "use": "Degraded DNA/eDNA.",
+                    # Taberlet et al. 1996
+                    "refs": _refs("9336234"),
+                }
+            ],
+            "Short eDNA-friendly locus.",
+        )
+
+    # ---------------- Animals ----------------
     if "metazoa" in lin or "animalia" in lin:
-        add("COI (Folmer region)",[
-            {"name":"LCO1490 / HCO2198","fwd":"GGTCAACAAATCATAAAGATATTGG","rev":"TAAACTTCAGGGTGACCAAAAAATCA",
-             "amplicon_bp":"~650 bp","platforms":["Sanger","Illumina PE300","ONT/PacBio"],"use":"Standard animal barcode."}
-        ], "Standard animal barcode.")
-        add("12S (eDNA vertebrates)",[
-            {"name":"MiFish-U","fwd":"GTCGGTAAAACTCGTGCCAGC","rev":"CATAGTGGGGTATCTAATCCCAGTTTG",
-             "amplicon_bp":"~170 bp","platforms":["eDNA-short","Illumina PE250"],"use":"Vertebrate eDNA surveys."}
-        ], "Great for vertebrate eDNA.")
-    if "eukaryota" in lin and not any(k in lin for k in ["animalia","plantae","fungi"]):
-        add("18S rRNA (V4 / V9)",[
-            {"name":"18S V4 (general)","fwd":"CCAGCASCYGCGGTAATTCC","rev":"ACTTTCGTTCTTGATYRA",
-             "amplicon_bp":"~380–420 bp (V4)","platforms":["Illumina PE250","Illumina PE300","Sanger"],"use":"Pan-eukaryote survey."}
-        ], "Pan-eukaryotic survey marker.")
+        add(
+            "COI (Folmer region)",
+            [
+                {
+                    "name": "LCO1490 / HCO2198",
+                    "fwd": "GGTCAACAAATCATAAAGATATTGG",
+                    "rev": "TAAACTTCAGGGTGACCAAAAAATCA",
+                    "amplicon_bp": "~650 bp",
+                    "platforms": ["Sanger", "Illumina PE300", "ONT/PacBio"],
+                    "use": "Standard animal barcode.",
+                    # Folmer et al. 1994
+                    "refs": _refs("7881515"),
+                }
+            ],
+            "Standard animal barcode.",
+        )
+        add(
+            "12S (eDNA vertebrates)",
+            [
+                {
+                    "name": "MiFish-U",
+                    "fwd": "GTCGGTAAAACTCGTGCCAGC",
+                    "rev": "CATAGTGGGGTATCTAATCCCAGTTTG",
+                    "amplicon_bp": "~170 bp",
+                    "platforms": ["eDNA-short", "Illumina PE250"],
+                    "use": "Vertebrate eDNA surveys.",
+                    # MiFish (Miya et al. 2015) – DOI
+                    "refs": _refs("10.1093/gigascience/giy123"),
+                }
+            ],
+            "Great for vertebrate eDNA.",
+        )
+
+    # ---------------- Other eukaryotes ----------------
+    if "eukaryota" in lin and not any(k in lin for k in ["animalia", "plantae", "fungi"]):
+        add(
+            "18S rRNA (V4 / V9)",
+            [
+                {
+                    "name": "18S V4 (general)",
+                    "fwd": "CCAGCASCYGCGGTAATTCC",
+                    "rev": "ACTTTCGTTCTTGATYRA",
+                    "amplicon_bp": "~380–420 bp (V4)",
+                    "platforms": ["Illumina PE250", "Illumina PE300", "Sanger"],
+                    "use": "Pan-eukaryote survey.",
+                    # Stoeck et al. 2010 (V4) – DOI
+                    "refs": _refs("10.1111/j.1365-294X.2010.04695.x"),
+                }
+            ],
+            "Pan-eukaryotic survey marker.",
+        )
+
     return out
+
 
 def quick_blast_guess(seq: str, program: str = "blastn", db: str = "nt", hitlist_size: int = 5):
     seq = sanitize_dna(seq)
@@ -297,6 +534,17 @@ def build_context_from_request(form):
             best_row = ranked[0]
         if best_row and best_row.get("ftp"):
             links = build_download_links(best_row["ftp"])
+
+        if best_row:
+            if best_row.get("size_mb") in (None, 0, 0.0):
+                mb = _fetch_size_mb_from_ftp_stats(best_row.get("ftp") or "")
+                if mb:
+                    best_row["size_mb"] = mb
+                    # also update the row in ranked so the table shows it
+                    for r in ranked:
+                        if r["assembly_accession"] == best_row["assembly_accession"]:
+                            r["size_mb"] = mb
+                            break
 
         suggestions = suggest_markers_from_lineage(tax_info.get("lineage",""))
 
