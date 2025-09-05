@@ -9,8 +9,6 @@ from functools import lru_cache
 from typing import Dict, List, Optional, Tuple
 from flask import Flask, request, jsonify
 
-import plotly.graph_objects as go
-
 
 import pandas as pd
 from flask import Flask, render_template, request, make_response
@@ -1175,46 +1173,6 @@ def make_entropy_plot(seqs, designed, locus: str, gc_window: int = 21, entropy_t
     return _encode_fig_to_b64(fig)
 
 
-
-# ---- Plotly payload (interactive entropy) ----
-def build_plotly_entropy_payload(seqs, designed, locus: str):
-    """Return a compact dict for Plotly: entropy series + top-5 primer overlays."""
-    ent = entropy_series(seqs)
-    if not ent:
-        return None
-    L = len(ent)
-
-    # Top 5 pairs for overlay
-    pairs = []
-    for idx, d in enumerate((designed or [])[:5], start=1):
-        pairs.append({
-            "i": idx,
-            "lp": int(d.get("left_pos", 0)),
-            "ll": int(d.get("len_left", 0)),
-            "rp": int(d.get("right_pos", 0)),
-            "rl": int(d.get("len_right", 0)),
-            "amp": int(d.get("amplicon_len") or 0)
-        })
-
-    # Optional AA track for coding loci
-    aa = None
-    if locus in CODING_LOCI and L >= 3 and seqs:
-        ref = seqs[0]["seq"][:(L // 3) * 3]
-        try:
-            aa = str(Seq(ref).translate())
-        except Exception:
-            aa = None
-
-    return {
-        "x": list(range(L)),
-        "y": ent,
-        "L": L,
-        "pairs": pairs,
-        "aa": aa
-    }
-
-
-
 def make_logo_plot(seqs):
     if not HAS_LOGOMAKER or not seqs:
         return None
@@ -1482,7 +1440,6 @@ def designer():
 
         "designed": None, "seqs_count": 0,
         "entropy_png": None, "logo_png": None,
-        "entropy_plotly": None,
     }
     return render_template("designer.html", **ctx)
 
@@ -1562,10 +1519,6 @@ def designer_run():
     logo_png = None
     ok_region_pairs = None
 
-
-    plotly_payload = None
-    if seqs and designed:
-        plotly_payload = build_plotly_entropy_payload(seqs[:200], designed, locus)  # cap to keep it snappy
 
 
     # Optional region constraints (auto windows from entropy)
@@ -1654,7 +1607,6 @@ def designer_run():
 
         "designed": designed, "seqs_count": len(seqs),
         "entropy_png": entropy_png, "logo_png": logo_png,
-        "entropy_plotly": json.dumps(plotly_payload) if plotly_payload else None,  # <-- add this
         "warning": warning, "error": error,
     }
     return render_template("designer.html", **ctx)
