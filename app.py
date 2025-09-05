@@ -9,6 +9,9 @@ from functools import lru_cache
 from typing import Dict, List, Optional, Tuple
 from flask import Flask, request, jsonify
 
+import plotly.graph_objects as go
+
+
 import pandas as pd
 from flask import Flask, render_template, request, make_response
 from dotenv import load_dotenv
@@ -33,6 +36,13 @@ from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, Tabl
 
 # Primer3
 import primer3
+
+# primer3 v2 uses snake_case; earlier versions used camelCase.
+# These aliases pick whichever exists so we stay compatible.
+_p3_calc_hairpin     = getattr(primer3, "calc_hairpin",     getattr(primer3, "calcHairpin"))
+_p3_calc_homodimer   = getattr(primer3, "calc_homodimer",   getattr(primer3, "calcHomodimer"))
+_p3_calc_heterodimer = getattr(primer3, "calc_heterodimer", getattr(primer3, "calcHeterodimer"))
+
 
 # Plotting
 import matplotlib
@@ -689,35 +699,36 @@ def _dinuc_ok(seq: str, max_repeats: int) -> bool:
     return True
 
 def _thermo_dGs(left: str, right: str, mv: float, dv: float, dntp: float, dna_nM: float) -> Dict[str, float]:
-    # primer3 returns objects with .dg (kcal/mol) and .structure_found
+    # Same arguments as before; just calling the compat aliases.
     kwargs = dict(mv_conc=mv, dv_conc=dv, dntp_conc=dntp, dna_conc=dna_nM, temp_c=60)
     try:
-        hpL = primer3.calcHairpin(left, **kwargs); dg_hpL = getattr(hpL, "dg", 0.0) or 0.0
+        hpL = _p3_calc_hairpin(left, **kwargs);  dg_hpL = float(getattr(hpL, "dg", 0.0) or 0.0)
     except Exception:
         dg_hpL = 0.0
     try:
-        hpR = primer3.calcHairpin(right, **kwargs); dg_hpR = getattr(hpR, "dg", 0.0) or 0.0
+        hpR = _p3_calc_hairpin(right, **kwargs); dg_hpR = float(getattr(hpR, "dg", 0.0) or 0.0)
     except Exception:
         dg_hpR = 0.0
     try:
-        sdL = primer3.calcHomodimer(left, **kwargs); dg_sdL = getattr(sdL, "dg", 0.0) or 0.0
+        sdL = _p3_calc_homodimer(left, **kwargs); dg_sdL = float(getattr(sdL, "dg", 0.0) or 0.0)
     except Exception:
         dg_sdL = 0.0
     try:
-        sdR = primer3.calcHomodimer(right, **kwargs); dg_sdR = getattr(sdR, "dg", 0.0) or 0.0
+        sdR = _p3_calc_homodimer(right, **kwargs); dg_sdR = float(getattr(sdR, "dg", 0.0) or 0.0)
     except Exception:
         dg_sdR = 0.0
     try:
-        het = primer3.calcHeterodimer(left, right, **kwargs); dg_het = getattr(het, "dg", 0.0) or 0.0
+        het = _p3_calc_heterodimer(left, right, **kwargs); dg_het = float(getattr(het, "dg", 0.0) or 0.0)
     except Exception:
         dg_het = 0.0
     return {
-        "dg_hp_left": float(dg_hpL),
-        "dg_hp_right": float(dg_hpR),
-        "dg_self_left": float(dg_sdL),
-        "dg_self_right": float(dg_sdR),
-        "dg_hetero": float(dg_het),
+        "dg_hp_left": dg_hpL,
+        "dg_hp_right": dg_hpR,
+        "dg_self_left": dg_sdL,
+        "dg_self_right": dg_sdR,
+        "dg_hetero": dg_het,
     }
+
 
 def _dG_pass(dgs: Dict[str,float], th_hp: float, th_self: float, th_hetero: float) -> bool:
     # thresholds are minimum acceptable (e.g., -2, -6, -7); we want dg >= threshold (less negative is better)
@@ -870,8 +881,13 @@ def design_primers_on_region(
     params = {
         'SEQUENCE_ID': 'target',
         'SEQUENCE_TEMPLATE': seq,
-        'SEQUENCE_TARGET': [target_start, target_len],
+        
     }
+    use_target = bool(target_len) and (target_len < len(seq))
+    if use_target:
+        params['SEQUENCE_TARGET'] = [max(0, int(target_start)), int(target_len)]
+
+    
     opts = {
         'PRIMER_TASK': 'generic' if candidate_mode == "pairs" else 'pick_primer_list',
         'PRIMER_PICK_LEFT_PRIMER': 1,
@@ -983,74 +999,221 @@ def _encode_fig_to_b64(fig, dpi=140):
     buf.seek(0)
     return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
 
-def make_entropy_plot(seqs, designed, locus: str):
+def make_entropy_plot(seqs, designed, locus: str, gc_window: int = 21, entropy_threshold: float = 0.60):
+    """
+    Entropy bar plot with:
+      • rolling GC% on twin y-axis
+      • coverage-weighted arrow width
+      • penalty-tinted labels
+      • micro pass/fail chips for GC-clamp, ΔG, k-mer uniqueness
+      • faint entropy threshold line
+    """
     if not seqs:
         return None
+
+    from matplotlib import cm, colors
+    from matplotlib.patches import Rectangle
+    from matplotlib.transforms import blended_transform_factory
+
+    # --- entropy series (existing helper) ---
     ent = entropy_series(seqs)
+    if not ent:
+        return None
     L = len(ent)
     x = np.arange(L)
 
-    fig, ax = plt.subplots(figsize=(13.5, 3.6))
+    # --- coverage-wide GC% across alignment (rolling window) ---
+    # compute per-position GC fraction over all sequences (ignore Ns)
+    denom = np.zeros(L, dtype=float)
+    gc_ct = np.zeros(L, dtype=float)
+    for s in seqs:
+        t = s["seq"][:L]
+        for i, b in enumerate(t):
+            if b in "ACGT":
+                denom[i] += 1.0
+                if b in "GC":
+                    gc_ct[i] += 1.0
+    gc_frac = np.divide(gc_ct, np.maximum(denom, 1.0))
+    if gc_window and gc_window > 1:
+        k = np.ones(gc_window, dtype=float) / gc_window
+        gc_roll = np.convolve(gc_frac, k, mode="same")
+    else:
+        gc_roll = gc_frac
+
+    # --- figure & primary axis (entropy) ---
+    fig, ax = plt.subplots(figsize=(13.5, 3.8))
     ax.bar(x, ent, width=1.0, color="#66c2d0")
     ax.set_ylim(0, max(1.8, max(ent) + 0.1))
     ax.set_xlim(0, L)
     ax.set_ylabel("Entropy", fontsize=10)
     ax.set_xlabel("Position (bp)", fontsize=10)
-    ax.set_xticks(np.arange(0, L+1, 50))
+    ax.set_xticks(np.arange(0, L + 1, 50))
     ax.grid(axis='y', alpha=0.15)
 
-    # Overlays: up to 5 candidates with labels
+    # faint threshold line
+    if entropy_threshold is not None:
+     ax.axhline(entropy_threshold, color="#ef4444", linestyle="--", linewidth=1, alpha=0.22)
+     ax.text(0.005, entropy_threshold + 0.03, f"H={entropy_threshold:.2f}",
+            transform=ax.get_yaxis_transform(), fontsize=8, color="#ef4444", alpha=0.7,
+            ha="left", va="bottom")
+
+
+    # --- twin axis: rolling GC% ---
+    ax2 = ax.twinx()
+    ax2.plot(x, gc_roll * 100.0, linewidth=1.6, alpha=0.65, color="#9aa5b1", label=f"GC% (rolling {gc_window})")
+    ax2.set_ylim(0, 100)
+    ax2.set_ylabel("GC % (rolling)", fontsize=9, color="#9aa5b1")
+    ax2.tick_params(axis='y', labelsize=8, colors="#9aa5b1")
+
+    # helper: clamp x to axis range
+    def clamp_x(v):
+        if v is None: return 0
+        if v < 0: return 0
+        if v > L - 1: return L - 1
+        return v
+
+    # color by penalty
+    norm = colors.Normalize(vmin=0.0, vmax=3.0)  # typical primer3 penalties
+    cmap = cm.get_cmap("RdYlGn_r")
+
+    # blended transform for micro chips: x in data, y in axes fraction
+    trans = blended_transform_factory(ax.transData, ax.transAxes)
+
+    # --- overlay up to 5 designed pairs ---
     for idx, d in enumerate((designed or [])[:5], start=1):
-        lp = d.get("left_pos", 0)
-        ll = d.get("len_left", 0)
-        rp = d.get("right_pos", 0)
-        rl = d.get("len_right", 0)
-        amp = d.get("amplicon_len", None)
+        lp = int(d.get("left_pos", 0) or 0)
+        ll = int(d.get("len_left", 0) or 0)
+        rp = int(d.get("right_pos", 0) or 0)
+        rl = int(d.get("len_right", 0) or 0)
+        amp = int(d.get("amplicon_len", 0) or 0)
+        pen = float(d.get("penalty", 0.0) or 0.0)
 
-        # forward primer arrow + label
-        ax.annotate("",
-            xy=(lp + ll, -0.05), xycoords=("data","axes fraction"),
-            xytext=(lp, -0.05), textcoords=("data","axes fraction"),
-            arrowprops=dict(arrowstyle="->", color="#22c55e", lw=2))
-        ax.text(lp, -0.12, f"P{idx} F", color="#22c55e", fontsize=8,
-                ha="left", va="top", transform=ax.get_xaxis_transform())
+        cov_pct = float(d.get("coverage_pct", 0.0) or 0.0)
+        lw = 1.3 + 3.2 * max(0.0, min(1.0, cov_pct / 100.0))  # coverage-weight arrow width
 
-        # reverse primer arrow + label
-        ax.annotate("",
-            xy=(rp, -0.10), xycoords=("data","axes fraction"),
-            xytext=(rp + rl, -0.10), textcoords=("data","axes fraction"),
-            arrowprops=dict(arrowstyle="->", color="#ef4444", lw=2))
-        ax.text(rp + rl, -0.17, f"P{idx} R", color="#ef4444", fontsize=8,
-                ha="right", va="top", transform=ax.get_xaxis_transform())
+        # clamp for drawing
+        f_x0 = clamp_x(lp)
+        f_x1 = clamp_x(lp + ll)
+        r_x0 = clamp_x(rp)
+        r_x1 = clamp_x(rp + rl)
 
-        # Amplicon span
-        span_start = lp + ll
+        # amplicon shade (between forward end and reverse start; fallback to product size if reversed)
+        span_start = f_x1
         span_end = rp
-        if span_end <= span_start and amp:
-            span_end = span_start + int(amp)
-        span_start = max(0, span_start)
-        span_end = min(L, span_end)
+        if span_end <= span_start and amp > 0:
+            span_end = span_start + amp
+        span_end = clamp_x(span_end)
         if span_end > span_start:
             ax.axvspan(span_start, span_end, color="#a9def9", alpha=0.18)
+       
+        # center label for amplicon length (only if we have a positive span)
+        if span_end > span_start and amp:
+            mid = 0.5 * (span_start + span_end)
+            ax.text(mid, 0.02, f"{amp} bp", transform=ax.get_xaxis_transform(),
+                fontsize=8, color="#8ab4f8", ha="center", va="bottom",
+                bbox=dict(boxstyle="round,pad=0.15", facecolor="#0b0f12", edgecolor="none", alpha=0.45))
 
-    # Codon/AA track for coding loci
-    if locus in CODING_LOCI and L >= 3:
-        ref = seqs[0]["seq"][:(L//3)*3]
+        # penalty-tinted color
+        lab_color = colors.to_hex(cmap(norm(pen)), keep_alpha=False)
+
+        # forward arrow (→)
+        ax.annotate(
+            "", xy=(f_x1, -0.06), xycoords=("data", "axes fraction"),
+            xytext=(f_x0, -0.06), textcoords=("data", "axes fraction"),
+            arrowprops=dict(arrowstyle="->", color="#22c55e", lw=lw),
+            clip_on=True,
+        )
+        ax.text(f_x0, -0.115, f"P{idx} F", color=lab_color, fontsize=8.5,
+                ha="left", va="top", transform=ax.get_xaxis_transform(), clip_on=True,
+                bbox=dict(boxstyle="round,pad=0.18", facecolor="#0b0f12", edgecolor="none", alpha=0.55))
+
+        # reverse arrow (←)
+        ax.annotate(
+            "", xy=(r_x0, -0.12), xycoords=("data", "axes fraction"),
+            xytext=(r_x1, -0.12), textcoords=("data", "axes fraction"),
+            arrowprops=dict(arrowstyle="->", color="#ef4444", lw=lw),
+            clip_on=True,
+        )
+        ax.text(r_x1, -0.175, f"P{idx} R", color=lab_color, fontsize=8.5,
+                ha="right", va="top", transform=ax.get_xaxis_transform(), clip_on=True,
+                bbox=dict(boxstyle="round,pad=0.18", facecolor="#0b0f12", edgecolor="none", alpha=0.55))
+
+        # micro pass/fail chips (three tiny squares): GC-clamp, ΔG, k-mer
+        chips = [
+            ("gc3_ok", d.get("gc3_ok", True)),
+            ("dg_ok", d.get("dg_ok", True)),
+            ("kmer_ok", d.get("kmer_ok", True)),
+        ]
+        chip_y = -0.205
+        chip_w = max(1.6, ll * 0.05)   # ~data units (bp) width
+        gap = chip_w * 0.6
+        start_x = f_x0
+        for i, (_, ok) in enumerate(chips):
+            c = "#22c55e" if ok else "#ef4444"
+            ax.add_patch(Rectangle((start_x + i * (chip_w + gap), chip_y),
+                                   chip_w, 0.028, transform=trans,
+                                   facecolor=c, edgecolor="none", alpha=0.85, clip_on=False))
+
+    # --- amino-acid tick overlay for coding loci (as before) ---
+    if locus in CODING_LOCI and L >= 3 and seqs:
+        ref = seqs[0]["seq"][:(L // 3) * 3]
         aa = str(Seq(ref).translate())
         codons = len(ref) // 3
-        yline = -0.28
-        ax.text(0, yline+0.02, "AA:", transform=ax.transAxes, fontsize=8,
+        yline = -0.30
+        ax.text(0, yline + 0.02, "AA:", transform=ax.transAxes, fontsize=8,
                 color="#94a3b8", ha="left", va="top")
-        for i in range(codons+1):
+        for i in range(codons + 1):
             bp = i * 3
             ax.axvline(bp, ymin=0, ymax=0.02, color="#94a3b833", lw=0.8)
         for i in range(0, codons, 3):
             bp = i * 3 + 1
-            ax.text(bp, -0.34, aa[i], transform=ax.get_xaxis_transform(),
-                    fontsize=7.5, color="#cbd5e1", ha="center", va="top")
+            if bp < L:
+                ax.text(bp, -0.36, aa[i], transform=ax.get_xaxis_transform(),
+                        fontsize=7.5, color="#cbd5e1", ha="center", va="top")
 
     fig.tight_layout()
     return _encode_fig_to_b64(fig)
+
+
+
+# ---- Plotly payload (interactive entropy) ----
+def build_plotly_entropy_payload(seqs, designed, locus: str):
+    """Return a compact dict for Plotly: entropy series + top-5 primer overlays."""
+    ent = entropy_series(seqs)
+    if not ent:
+        return None
+    L = len(ent)
+
+    # Top 5 pairs for overlay
+    pairs = []
+    for idx, d in enumerate((designed or [])[:5], start=1):
+        pairs.append({
+            "i": idx,
+            "lp": int(d.get("left_pos", 0)),
+            "ll": int(d.get("len_left", 0)),
+            "rp": int(d.get("right_pos", 0)),
+            "rl": int(d.get("len_right", 0)),
+            "amp": int(d.get("amplicon_len") or 0)
+        })
+
+    # Optional AA track for coding loci
+    aa = None
+    if locus in CODING_LOCI and L >= 3 and seqs:
+        ref = seqs[0]["seq"][:(L // 3) * 3]
+        try:
+            aa = str(Seq(ref).translate())
+        except Exception:
+            aa = None
+
+    return {
+        "x": list(range(L)),
+        "y": ent,
+        "L": L,
+        "pairs": pairs,
+        "aa": aa
+    }
+
+
 
 def make_logo_plot(seqs):
     if not HAS_LOGOMAKER or not seqs:
@@ -1064,6 +1227,8 @@ def make_logo_plot(seqs):
                 counts.at[b, i] += 1
     counts = counts.T
     fig, ax = plt.subplots(figsize=(13.5, 3.1))
+    # Give more room for the baseline labels + chips
+    fig.subplots_adjust(bottom=0.26)
     lm.Logo(counts, ax=ax, shade_below=.5, fade_below=.5, color_scheme="classic")
     ax.set_xlim(0, L)
     ax.set_xticks(np.arange(0, L+1, 50))
@@ -1314,6 +1479,10 @@ def designer():
         "entropy_png": None, "logo_png": None,
         "warning": None, "error": None,
         "has_logomaker": HAS_LOGOMAKER,
+
+        "designed": None, "seqs_count": 0,
+        "entropy_png": None, "logo_png": None,
+        "entropy_plotly": None,
     }
     return render_template("designer.html", **ctx)
 
@@ -1392,6 +1561,12 @@ def designer_run():
     entropy_png = None
     logo_png = None
     ok_region_pairs = None
+
+
+    plotly_payload = None
+    if seqs and designed:
+        plotly_payload = build_plotly_entropy_payload(seqs[:200], designed, locus)  # cap to keep it snappy
+
 
     # Optional region constraints (auto windows from entropy)
     if ref_seq and region_mode == "auto":
@@ -1476,6 +1651,11 @@ def designer_run():
         "entropy_png": entropy_png, "logo_png": logo_png,
         "warning": warning, "error": error,
         "has_logomaker": HAS_LOGOMAKER,
+
+        "designed": designed, "seqs_count": len(seqs),
+        "entropy_png": entropy_png, "logo_png": logo_png,
+        "entropy_plotly": json.dumps(plotly_payload) if plotly_payload else None,  # <-- add this
+        "warning": warning, "error": error,
     }
     return render_template("designer.html", **ctx)
 

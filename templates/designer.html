@@ -221,15 +221,9 @@
 
           <hr class="my-2 opacity-25">
           <div class="small text-secondary mb-2">Visualization</div>
-          <div class="d-flex gap-3 mb-3">
-            <div class="form-check">
-              <input class="form-check-input" type="radio" name="viz" id="viz1" value="entropy" {{ 'checked' if viz=='entropy' }}>
-              <label class="form-check-label" for="viz1">Entropy</label>
-            </div>
-            <div class="form-check">
-              <input class="form-check-input" type="radio" name="viz" id="viz2" value="logo" {{ 'checked' if viz=='logo' }}>
-              <label class="form-check-label" for="viz2">Sequence logo{% if not has_logomaker %} (install logomaker){% endif %}</label>
-            </div>
+          <div class="form-check mb-3">
+            <input class="form-check-input" type="radio" name="viz" id="viz1" value="entropy" {{ 'checked' if viz=='entropy' }}>
+            <label class="form-check-label" for="viz1">Entropy</label>
           </div>
 
           <div class="d-flex align-items-center gap-3">
@@ -251,47 +245,102 @@
   <div class="col-12 col-lg-8">
     <div class="card">
       <div class="card-body">
-        <h5 class="card-title"><i class="bi bi-diagram-3 me-2"></i>Designed primer candidates</h5>
+        <h5 class="card-title d-flex align-items-center">
+          <i class="bi bi-diagram-3 me-2"></i>Designed primer candidates
+        </h5>
 
-        {% if viz == 'logo' and logo_png %}
-          <div class="mb-3">
-            <img src="{{ logo_png }}" class="img-fluid rounded border border-secondary-subtle" alt="Sequence logo">
-            <div class="form-text">Sequence logo (A/C/G/T heights reflect frequency). Ticks every 50 bp.</div>
-          </div>
-        {% elif entropy_png %}
+        <!-- Page-local styles to tighten tables & improve header fit -->
+<style>
+  /* Scales legibly across widths without needing browser zoom */
+  :root{
+    --tbl-font-min:.68rem;         /* lower bound */
+    --tbl-font-ideal:.78vw;        /* viewport-scaled */
+    --tbl-font-max:.92rem;         /* upper bound */
+  }
+
+  .table-fixed{ table-layout:fixed; width:100%; }
+  .table-tight{ font-size:clamp(var(--tbl-font-min), var(--tbl-font-ideal), var(--tbl-font-max)); }
+
+  /* compact cell padding + line-height */
+  .table-tight td,.table-tight th{ padding:.32rem .44rem; line-height:1.15; }
+
+  /* keep primer strings readable but compact */
+  .primer-seq{
+    display:block; white-space:nowrap; overflow-x:auto; max-width:100%;
+    font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+    font-size:clamp(.62rem,.70vw,.82rem); line-height:1.1;
+  }
+
+  /* smaller header text; prevent wrapping in narrow columns */
+  .table-tight thead th{ font-size:clamp(.70rem,.72vw,.86rem); white-space:nowrap; }
+  .th-xs{ font-size:clamp(.68rem,.70vw,.82rem); white-space:nowrap; }
+
+  /* compact badges (penalty & QC chips) */
+  .table-tight .badge{ font-size:.62rem; padding:.18rem .32rem; border-radius:.35rem; }
+
+  /* disable sticky header here to avoid overlap with the plot area */
+  .no-sticky thead th{ position:static !important; }
+
+  /* compress vertical gaps between blocks */
+  .section-gap{ margin-top:.3rem; margin-bottom:.45rem; }
+
+  /* plot image spacing */
+  .plot-img{ display:block; width:100%; border-radius:.5rem; }
+</style>
+
+
+        {% if entropy_png %}
           <div class="mb-2">
-            <img src="{{ entropy_png }}" class="img-fluid rounded border border-secondary-subtle" alt="Conservation plot">
+            <img src="{{ entropy_png }}" class="plot-img border border-secondary-subtle" alt="Conservation plot">
           </div>
-          <div class="form-text mb-3">
-            Conservation (lower entropy = more conserved). <span class="text-success">Green</span> = forward, <span class="text-danger">Red</span> = reverse, shaded = amplicon. Ticks every 50 bp. AA track for coding loci.
+          <div class="form-text section-gap">
+            Conservation (lower entropy = more conserved).
+            <span class="text-success">Green</span> = forward,
+            <span class="text-danger">Red</span> = reverse, shaded = amplicon. Ticks every 50 bp. AA track for coding loci.
           </div>
         {% else %}
-          <p class="text-secondary">Run the wizard to generate primer candidates. You’ll see Tm/GC, penalties, coverage, QC badges, and a 3′-end uniqueness score.</p>
+          <p class="text-secondary section-gap">
+            Run the wizard to generate primer candidates. You’ll see Tm/GC, penalties, coverage, QC badges, and a 3′-end uniqueness score.
+          </p>
         {% endif %}
 
         {% if designed %}
-          <!-- Compact summary under the plot: top 5 pairs -->
-          <div class="table-responsive mb-3">
-            <table class="table table-sm table-bordered align-middle">
-              <thead class="table-dark">
+          <!-- Compact summary under the plot: top 5 -->
+          <div class="table-responsive section-gap">
+            <table class="table table-sm table-bordered align-middle table-fixed table-tight no-sticky">
+              <colgroup>
+                <col style="width:6%">
+                <col style="width:34%">
+                <col style="width:34%">
+                <col style="width:10%">
+                <col style="width:6%">
+                <col style="width:10%">
+              </colgroup>
+              <thead>
                 <tr>
-                  <th>Pair</th>
-                  <th>Forward (pos/len/Tm/GC)</th>
-                  <th>Reverse (pos/len/Tm/GC)</th>
-                  <th>Amplicon</th>
-                  <th>Penalty</th>
-                  <th>Coverage</th>
+                  <th class="th-xs">Pair</th>
+                  <th class="th-xs">Forward (pos/len/Tm/GC)</th>
+                  <th class="th-xs">Reverse (pos/len/Tm/GC)</th>
+                  <th class="th-xs">Amplicon</th>
+                  <th class="th-xs">Penalty</th>
+                  <th class="th-xs">Coverage</th>
                 </tr>
               </thead>
               <tbody>
                 {% for d in designed[:5] %}
                   <tr>
-                    <td>P{{ loop.index }}</td>
-                    <td><code>{{ d.left }}</code><br>
-                      <span class="text-secondary">pos {{ d.left_pos }}, len {{ d.len_left }}, Tm {{ d.tm_left }}°C, GC {{ d.gc_left }}%</span>
+                    <td class="text-secondary">P{{ loop.index }}</td>
+                    <td>
+                      <span class="primer-seq">{{ d.left }}</span>
+                      <div class="text-secondary small">
+                        pos {{ d.left_pos }}, len {{ d.len_left }}, Tm {{ d.tm_left }}°C, GC {{ d.gc_left }}%
+                      </div>
                     </td>
-                    <td><code>{{ d.right }}</code><br>
-                      <span class="text-secondary">pos {{ d.right_pos }}, len {{ d.len_right }}, Tm {{ d.tm_right }}°C, GC {{ d.gc_right }}%</span>
+                    <td>
+                      <span class="primer-seq">{{ d.right }}</span>
+                      <div class="text-secondary small">
+                        pos {{ d.right_pos }}, len {{ d.len_right }}, Tm {{ d.tm_right }}°C, GC {{ d.gc_right }}%
+                      </div>
                     </td>
                     <td>{{ d.amplicon_len }} bp</td>
                     <td><span class="badge bg-secondary-subtle text-light">{{ d.penalty }}</span></td>
@@ -310,23 +359,23 @@
 
           <!-- Full table with QC & 3' uniqueness -->
           <div class="table-responsive">
-            <table class="table table-sm table-hover align-middle">
+            <table class="table table-sm table-hover align-middle table-fixed table-tight no-sticky">
               <thead>
                 <tr>
-                  <th>#</th>
-                  <th>Forward</th>
-                  <th>Reverse</th>
-                  <th>Tm (°C)</th>
-                  <th>GC %</th>
-                  <th>Amplicon</th>
-                  <th>Penalty</th>
-                  <th>3′ GC clamp</th>
-                  <th>Runs</th>
-                  <th>Di-nuc</th>
-                  <th>ΔG (HP/Self/Het)</th>
-                  <th>3′ uniq</th>
-                  <th>Coverage</th>
-                  <th>BLAST</th>
+                  <th class="th-xs" style="width:3%">#</th>
+                  <th class="th-xs" style="width:24%">Forward</th>
+                  <th class="th-xs" style="width:24%">Reverse</th>
+                  <th class="th-xs" style="width:8%">Tm (°C)</th>
+                  <th class="th-xs" style="width:8%">GC %</th>
+                  <th class="th-xs" style="width:7%">Amplicon</th>
+                  <th class="th-xs" style="width:6%">Penalty</th>
+                  <th class="th-xs" style="width:8%">3′ GC clamp</th>
+                  <th class="th-xs" style="width:5%">Runs</th>
+                  <th class="th-xs" style="width:6%">Di-nuc</th>
+                  <th class="th-xs" style="width:11%">ΔG (HP/Self/Het)</th>
+                  <th class="th-xs" style="width:8%">3′ uniq</th>
+                  <th class="th-xs" style="width:12%">Coverage</th>
+                  <th class="th-xs" style="width:6%">BLAST</th>
                 </tr>
               </thead>
               <tbody>
@@ -335,8 +384,8 @@
                   {% set ok_dinuc = (d.dinuc_ok_f and d.dinuc_ok_r) %}
                   <tr class="{% if not (d.gc3_ok and ok_runs and ok_dinuc and d.dg_ok and d.kmer_ok) %}table-warning{% endif %}">
                     <td class="text-secondary">{{ loop.index }}</td>
-                    <td style="max-width:280px"><code>{{ d.left }}</code></td>
-                    <td style="max-width:280px"><code>{{ d.right }}</code></td>
+                    <td><span class="primer-seq">{{ d.left }}</span></td>
+                    <td><span class="primer-seq">{{ d.right }}</span></td>
                     <td>{{ d.tm_left }} / {{ d.tm_right }}</td>
                     <td>{{ d.gc_left }} / {{ d.gc_right }}</td>
                     <td>{{ d.amplicon_len }}</td>
