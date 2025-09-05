@@ -14,68 +14,7 @@
     <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.css" rel="stylesheet">
 
     <link href="{{ url_for('static', filename='styles.css') }}" rel="stylesheet">
-    <style>
-/* ------- Compact mode for Finder landing ------- */
-.compact-ui { /* reduce global type scale a touch */
-  --ui-font: .94rem;
-}
-.compact-ui .row.g-4{           /* tighten page gutters */
-  --bs-gutter-x: 1rem; 
-  --bs-gutter-y: 1rem;
-}
-
-/* Cards */
-.compact-ui .card-body{ padding: .8rem 1rem; }
-.compact-ui .card-title{ font-size: 1rem; margin-bottom: .4rem; }
-
-/* Forms */
-.compact-ui .form-label{ font-size: .85rem; margin-bottom: .25rem; }
-.compact-ui .form-control,
-.compact-ui .form-select{ 
-  padding: .35rem .55rem; 
-  font-size: var(--ui-font);
-  height: calc(1.55em + .7rem + 2px);
-}
-.compact-ui .form-check-label{ font-size: .85rem; }
-.compact-ui .help-hint,
-.compact-ui .form-text{ font-size: .82rem; margin-top: .15rem; }
-
-/* Buttons & badges */
-.compact-ui .btn{ padding: .34rem .6rem; font-size: .92rem; }
-.compact-ui .btn-sm{ padding: .28rem .5rem; font-size: .86rem; }
-.compact-ui .badge{ font-size: .72rem; padding: .3em .45em; }
-
-/* Tables (assemblies list, etc.) */
-.compact-ui .table{ font-size: .92rem; }
-.compact-ui .table>:not(caption)>*>*{ padding: .42rem .55rem; }
-.compact-ui .table thead th{ font-size: .82rem; white-space: nowrap; }
-
-/* Lists / alerts */
-.compact-ui .list-group-item,
-.compact-ui .alert{ padding: .55rem .75rem; }
-
-/* Headings & big numerals (KPIs) */
-.compact-ui .display-6, 
-.compact-ui .fs-1, 
-.compact-ui .fs-2{ font-size: 1.4rem !important; }
-.compact-ui .lead{ font-size: .98rem; }
-
-/* “Direct downloads” as a tidy 2-col grid if you add .dl-grid wrapper */
-.compact-ui .dl-grid{ display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: .25rem .75rem; }
-.compact-ui .dl-grid a{ display:inline-block; padding:.15rem 0; }
-
-/* Dense metric tiles (if you use little stat boxes) */
-.compact-ui .stat, 
-.compact-ui .kpi { padding:.6rem .75rem; }
-.compact-ui .stat .stat-label,
-.compact-ui .kpi .label{ font-size:.78rem; }
-.compact-ui .stat .stat-value,
-.compact-ui .kpi .value{ font-size:1rem; }
-
-/* Minor general tweaks */
-.compact-ui .section-gap{ margin-top:.35rem; margin-bottom:.55rem; }
-</style>
-
+    
     <style>
       :root{
         --mf-bg:#0f1115; --mf-card:#161a21cc; --mf-accent:#62e0ff;
@@ -129,10 +68,10 @@
         <div class="collapse navbar-collapse" id="mfNav">
           <ul class="navbar-nav me-auto mb-2 mb-lg-0">
             <li class="nav-item">
-              <a class="nav-link" href="/">Finder</a>
+              <a class="nav-link" href="./">Finder</a>
             </li>
             <li class="nav-item">
-              <a class="nav-link" href="/designer">Primer Wizard</a>
+              <a class="nav-link" href="./designer">Primer Wizard</a>
             </li>
           </ul>
           <div class="d-flex align-items-center gap-3 small text-secondary">
