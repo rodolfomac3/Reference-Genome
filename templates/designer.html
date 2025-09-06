@@ -249,45 +249,48 @@
           <i class="bi bi-diagram-3 me-2"></i>Designed primer candidates
         </h5>
 
-        <!-- Page-local styles to tighten tables & improve header fit -->
-<style>
-  /* Scales legibly across widths without needing browser zoom */
-  :root{
-    --tbl-font-min:.68rem;         /* lower bound */
-    --tbl-font-ideal:.78vw;        /* viewport-scaled */
-    --tbl-font-max:.92rem;         /* upper bound */
-  }
+        <!-- Page-local styles just for the results -->
+        <style>
+          /* ---- Plot ---- */
+          .plot-img{ display:block; width:100%; border-radius:.5rem; }
 
-  .table-fixed{ table-layout:fixed; width:100%; }
-  .table-tight{ font-size:clamp(var(--tbl-font-min), var(--tbl-font-ideal), var(--tbl-font-max)); }
+          /* ---- Tables ---- */
+          :root{
+            --tbl-font-min:.72rem;
+            --tbl-font-ideal:.78vw;
+            --tbl-font-max:.95rem;
+          }
+          .table-fixed{ table-layout:fixed; width:100%; }
+          .table-tight{ font-size:clamp(var(--tbl-font-min), var(--tbl-font-ideal), var(--tbl-font-max)); }
+          .table-tight td,.table-tight th{ padding:.44rem .56rem; line-height:1.1; }
+          .table-tight thead th{
+            white-space:nowrap;
+            font-weight:600;
+            font-size:clamp(.70rem,.72vw,.88rem);
+            overflow:hidden;
+            text-overflow:ellipsis;
+          }
+          .num{
+            font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+            font-variant-numeric:tabular-nums;
+            letter-spacing:.02em;
+          }
+          .th-xs{ white-space:nowrap; }
+          .badge{ font-size:.64em; padding:.22rem .36rem; border-radius:.4rem; }
+          .btn-blast{ padding:.25rem .4rem; line-height:1; }
+          .section-gap{ margin-top:.3rem; margin-bottom:.5rem; }
 
-  /* compact cell padding + line-height */
-  .table-tight td,.table-tight th{ padding:.32rem .44rem; line-height:1.15; }
+          /* Responsive headers: long/short labels */
+          .h-abbr{ display:none; }
+          @media (max-width: 1400px){
+            .h-full{ display:none; }
+            .h-abbr{ display:initial; }
+          }
 
-  /* keep primer strings readable but compact */
-  .primer-seq{
-    display:block; white-space:nowrap; overflow-x:auto; max-width:100%;
-    font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
-    font-size:clamp(.62rem,.70vw,.82rem); line-height:1.1;
-  }
-
-  /* smaller header text; prevent wrapping in narrow columns */
-  .table-tight thead th{ font-size:clamp(.70rem,.72vw,.86rem); white-space:nowrap; }
-  .th-xs{ font-size:clamp(.68rem,.70vw,.82rem); white-space:nowrap; }
-
-  /* compact badges (penalty & QC chips) */
-  .table-tight .badge{ font-size:.62rem; padding:.18rem .32rem; border-radius:.35rem; }
-
-  /* disable sticky header here to avoid overlap with the plot area */
-  .no-sticky thead th{ position:static !important; }
-
-  /* compress vertical gaps between blocks */
-  .section-gap{ margin-top:.3rem; margin-bottom:.45rem; }
-
-  /* plot image spacing */
-  .plot-img{ display:block; width:100%; border-radius:.5rem; }
-</style>
-
+          /* Make sure last columns don't encroach */
+          .nowrap{ white-space:nowrap; }
+          .center{ text-align:center; }
+        </style>
 
         {% if entropy_png %}
           <div class="mb-2">
@@ -307,135 +310,148 @@
         {% if designed %}
           <!-- Compact summary under the plot: top 5 -->
           <div class="table-responsive section-gap">
-            <table class="table table-sm table-bordered align-middle table-fixed table-tight no-sticky">
+            <table class="table table-sm table-bordered align-middle table-fixed table-tight">
               <colgroup>
+                <col style="width:7%">
+                <col style="width:36%">
+                <col style="width:36%">
+                <col style="width:9%">
                 <col style="width:6%">
-                <col style="width:34%">
-                <col style="width:34%">
-                <col style="width:10%">
                 <col style="width:6%">
-                <col style="width:10%">
               </colgroup>
               <thead>
                 <tr>
-                  <th class="th-xs">Pair</th>
-                  <th class="th-xs">Forward (pos/len/Tm/GC)</th>
-                  <th class="th-xs">Reverse (pos/len/Tm/GC)</th>
-                  <th class="th-xs">Amplicon</th>
-                  <th class="th-xs">Penalty</th>
-                  <th class="th-xs">Coverage</th>
+                  <th>Pair</th>
+                  <th>Forward (pos/len/Tm/GC)</th>
+                  <th>Reverse (pos/len/Tm/GC)</th>
+                  <th class="center">Amp</th>
+                  <th class="center">Penalty</th>
+                  <th class="center">Coverage</th>
                 </tr>
               </thead>
               <tbody>
                 {% for d in designed[:5] %}
-                  <tr>
-                    <td class="text-secondary">P{{ loop.index }}</td>
-                    <td>
-                      <span class="primer-seq">{{ d.left }}</span>
-                      <div class="text-secondary small">
-                        pos {{ d.left_pos }}, len {{ d.len_left }}, Tm {{ d.tm_left }}°C, GC {{ d.gc_left }}%
-                      </div>
-                    </td>
-                    <td>
-                      <span class="primer-seq">{{ d.right }}</span>
-                      <div class="text-secondary small">
-                        pos {{ d.right_pos }}, len {{ d.len_right }}, Tm {{ d.tm_right }}°C, GC {{ d.gc_right }}%
-                      </div>
-                    </td>
-                    <td>{{ d.amplicon_len }} bp</td>
-                    <td><span class="badge bg-secondary-subtle text-light">{{ d.penalty }}</span></td>
-                    <td>
-                      {% if d.coverage_total %}
-                        {{ d.coverage_pct }}% ({{ d.coverage_hits }}/{{ d.coverage_total }})
-                      {% else %}
-                        <span class="text-secondary">—</span>
-                      {% endif %}
-                    </td>
-                  </tr>
+                <tr>
+                  <td class="text-secondary">P{{ loop.index }}</td>
+                  <td>
+                    <div class="num">{{ d.left }}</div>
+                    <div class="text-secondary small">
+                      pos {{ d.left_pos }}, len {{ d.len_left }}, Tm {{ d.tm_left }}°C, GC {{ d.gc_left }}%
+                    </div>
+                  </td>
+                  <td>
+                    <div class="num">{{ d.right }}</div>
+                    <div class="text-secondary small">
+                      pos {{ d.right_pos }}, len {{ d.len_right }}, Tm {{ d.tm_right }}°C, GC {{ d.gc_right }}%
+                    </div>
+                  </td>
+                  <td class="center num">{{ d.amplicon_len }}</td>
+                  <td class="center"><span class="badge bg-secondary-subtle text-light">{{ d.penalty }}</span></td>
+                  <td class="center">
+                    {% if d.coverage_total %}
+                      {{ d.coverage_pct }}% ({{ d.coverage_hits }}/{{ d.coverage_total }})
+                    {% else %}<span class="text-secondary">—</span>{% endif %}
+                  </td>
+                </tr>
                 {% endfor %}
               </tbody>
             </table>
           </div>
 
-          <!-- Full table with QC & 3' uniqueness -->
+          <!-- Full table -->
           <div class="table-responsive">
-            <table class="table table-sm table-hover align-middle table-fixed table-tight no-sticky">
+            <table class="table table-sm table-hover align-middle table-fixed table-tight">
+              <colgroup>
+                <col style="width:3%">
+                <col style="width:22%">
+                <col style="width:22%">
+                <col style="width:8%">   <!-- Tm -->
+                <col style="width:7%">   <!-- GC -->
+                <col style="width:5.5%"> <!-- Amp -->
+                <col style="width:6%">   <!-- Penalty -->
+                <col style="width:7%">   <!-- 3' clamp -->
+                <col style="width:6%">   <!-- Runs -->
+                <col style="width:6%">   <!-- Di-nuc -->
+                <col style="width:14%">  <!-- ΔG -->
+                <col style="width:7%">   <!-- 3' uniq (wider than before) -->
+                <col style="width:7%">   <!-- Coverage -->
+                <col style="width:4.5%"> <!-- BL -->
+              </colgroup>
               <thead>
                 <tr>
-                  <th class="th-xs" style="width:3%">#</th>
-                  <th class="th-xs" style="width:24%">Forward</th>
-                  <th class="th-xs" style="width:24%">Reverse</th>
-                  <th class="th-xs" style="width:8%">Tm (°C)</th>
-                  <th class="th-xs" style="width:8%">GC %</th>
-                  <th class="th-xs" style="width:7%">Amplicon</th>
-                  <th class="th-xs" style="width:6%">Penalty</th>
-                  <th class="th-xs" style="width:8%">3′ GC clamp</th>
-                  <th class="th-xs" style="width:5%">Runs</th>
-                  <th class="th-xs" style="width:6%">Di-nuc</th>
-                  <th class="th-xs" style="width:11%">ΔG (HP/Self/Het)</th>
-                  <th class="th-xs" style="width:8%">3′ uniq</th>
-                  <th class="th-xs" style="width:12%">Coverage</th>
-                  <th class="th-xs" style="width:6%">BLAST</th>
+                  <th class="th-xs">#</th>
+                  <th class="th-xs">Forward</th>
+                  <th class="th-xs">Reverse</th>
+                  <th class="th-xs center">Tm (°C)</th>
+                  <th class="th-xs center">GC %</th>
+                  <th class="th-xs center">Amp</th>
+                  <th class="th-xs center">Penalty</th>
+                  <th class="th-xs center">3′ clamp</th>
+                  <th class="th-xs center">Runs</th>
+                  <th class="th-xs center">Di-nuc</th>
+                  <th class="th-xs center">
+                    <span class="h-full">ΔG HP/Self/Het</span>
+                    <span class="h-abbr">ΔG HP/Self/Het</span>
+                  </th>
+                  <th class="th-xs center">3′ uniq</th>
+                  <th class="th-xs center">Cov.</th>
+                  <th class="th-xs center">BL</th>
                 </tr>
               </thead>
               <tbody>
                 {% for d in designed[:30] %}
-                  {% set ok_runs = (d.homopoly_ok_f and d.homopoly_ok_r) %}
-                  {% set ok_dinuc = (d.dinuc_ok_f and d.dinuc_ok_r) %}
-                  <tr class="{% if not (d.gc3_ok and ok_runs and ok_dinuc and d.dg_ok and d.kmer_ok) %}table-warning{% endif %}">
-                    <td class="text-secondary">{{ loop.index }}</td>
-                    <td><span class="primer-seq">{{ d.left }}</span></td>
-                    <td><span class="primer-seq">{{ d.right }}</span></td>
-                    <td>{{ d.tm_left }} / {{ d.tm_right }}</td>
-                    <td>{{ d.gc_left }} / {{ d.gc_right }}</td>
-                    <td>{{ d.amplicon_len }}</td>
-                    <td><span class="badge bg-secondary-subtle text-light">{{ d.penalty }}</span></td>
+                {% set ok_runs = (d.homopoly_ok_f and d.homopoly_ok_r) %}
+                {% set ok_dinuc = (d.dinuc_ok_f and d.dinuc_ok_r) %}
+                <tr class="{% if not (d.gc3_ok and ok_runs and ok_dinuc and d.dg_ok and d.kmer_ok) %}table-warning{% endif %}">
+                  <td class="text-secondary">{{ loop.index }}</td>
+                  <td class="num">{{ d.left }}</td>
+                  <td class="num">{{ d.right }}</td>
 
-                    <td>
-                      <span class="badge {% if d.gc3_ok %}bg-success{% else %}bg-danger{% endif %}">
-                        F {{ d.gc3_f }} / R {{ d.gc3_r }}
-                      </span>
-                    </td>
+                  <td class="center num">{{ d.tm_left }} / {{ d.tm_right }}</td>
+                  <td class="center num">{{ d.gc_left }} / {{ d.gc_right }}</td>
+                  <td class="center num">{{ d.amplicon_len }}</td>
 
-                    <td>
-                      <span class="badge {% if ok_runs %}bg-success{% else %}bg-danger{% endif %}">poly</span>
-                    </td>
+                  <td class="center"><span class="badge bg-secondary-subtle text-light">{{ d.penalty }}</span></td>
 
-                    <td>
-                      <span class="badge {% if ok_dinuc %}bg-success{% else %}bg-danger{% endif %}">2-mer</span>
-                    </td>
+                  <td class="center">
+                    <span class="badge {% if d.gc3_ok %}bg-success{% else %}bg-danger{% endif %}">F {{ d.gc3_f }} / R {{ d.gc3_r }}</span>
+                  </td>
 
-                    <td>
-                      <span class="badge {% if d.dg_ok %}bg-success{% else %}bg-danger{% endif %}">
-                        {{ '%.1f'|format(d.dg_hp_left) }}/{{ '%.1f'|format(d.dg_self_left) }}/{{ '%.1f'|format(d.dg_hetero) }}
-                      </span>
-                    </td>
+                  <td class="center">
+                    <span class="badge {% if ok_runs %}bg-success{% else %}bg-danger{% endif %}">poly</span>
+                  </td>
 
-                    <td>
-                      <span class="badge {% if d.kmer_ok %}bg-success{% else %}bg-danger{% endif %}">
-                        F {{ d.kmer_hits_f }} / R {{ d.kmer_hits_r }}
-                      </span>
-                    </td>
+                  <td class="center">
+                    <span class="badge {% if ok_dinuc %}bg-success{% else %}bg-danger{% endif %}">2-mer</span>
+                  </td>
 
-                    <td>
-                      {% if d.coverage_total %}
-                        {{ d.coverage_pct }}% ({{ d.coverage_hits }}/{{ d.coverage_total }})
-                      {% else %}
-                        <span class="text-secondary">—</span>
-                      {% endif %}
-                    </td>
+                  <td class="center">
+                    <span class="badge {% if d.dg_ok %}bg-success{% else %}bg-danger{% endif %} num">
+                      {{ '%.1f'|format(d.dg_hp_left) }}/{{ '%.1f'|format(d.dg_self_left) }}/{{ '%.1f'|format(d.dg_hetero) }}
+                    </span>
+                  </td>
 
-                    <td>
-                      <form action="/designer/blast" method="post" target="_blank" class="d-flex gap-1">
-                        <input type="hidden" name="primer" value="{{ d.left }}">
-                        <button class="btn btn-outline-primary btn-sm" type="submit" title="BLAST forward">F</button>
-                      </form>
-                      <form action="/designer/blast" method="post" target="_blank" class="d-flex gap-1 mt-1">
-                        <input type="hidden" name="primer" value="{{ d.right }}">
-                        <button class="btn btn-outline-danger btn-sm" type="submit" title="BLAST reverse">R</button>
-                      </form>
-                    </td>
-                  </tr>
+                  <td class="center">
+                    <span class="badge {% if d.kmer_ok %}bg-success{% else %}bg-danger{% endif %}">F {{ d.kmer_hits_f }} / R {{ d.kmer_hits_r }}</span>
+                  </td>
+
+                  <td class="center">
+                    {% if d.coverage_total %}
+                      {{ d.coverage_pct }}% ({{ d.coverage_hits }}/{{ d.coverage_total }})
+                    {% else %}<span class="text-secondary">—</span>{% endif %}
+                  </td>
+
+                  <td class="center">
+                    <div class="d-inline-flex flex-column gap-1">
+                      <button type="button" class="btn btn-outline-primary btn-sm btn-blast"
+                              data-primer="{{ d.left }}" data-bs-toggle="modal" data-bs-target="#blastModal"
+                              title="BLAST forward">F</button>
+                      <button type="button" class="btn btn-outline-danger btn-sm btn-blast"
+                              data-primer="{{ d.right }}" data-bs-toggle="modal" data-bs-target="#blastModal"
+                              title="BLAST reverse">R</button>
+                    </div>
+                  </td>
+                </tr>
                 {% endfor %}
               </tbody>
             </table>
@@ -450,4 +466,68 @@
     </div>
   </div>
 </div>
+
+<!-- BLAST Results Modal -->
+<div class="modal fade" id="blastModal" tabindex="-1" aria-labelledby="blastModalLabel" aria-hidden="true">
+  <div class="modal-dialog modal-lg modal-dialog-scrollable">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h6 class="modal-title" id="blastModalLabel">Primer BLAST</h6>
+        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+      </div>
+      <div class="modal-body" id="blastModalBody">
+        <div class="d-flex align-items-center gap-2 text-secondary">
+          <div class="spinner-border spinner-border-sm" role="status" aria-hidden="true"></div>
+          <span>Submitting primer to NCBI…</span>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-outline-secondary btn-sm" data-bs-dismiss="modal">Close</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Page script to wire up BLAST buttons -->
+<script>
+document.addEventListener("DOMContentLoaded", () => {
+  const modalEl = document.getElementById("blastModal");
+  const modalBody = document.getElementById("blastModalBody");
+  const defaultBody = `
+    <div class="d-flex align-items-center gap-2 text-secondary">
+      <div class="spinner-border spinner-border-sm" role="status" aria-hidden="true"></div>
+      <span>Submitting primer to NCBI…</span>
+    </div>
+  `;
+
+  document.querySelectorAll(".btn-blast").forEach(btn => {
+    btn.addEventListener("click", async () => {
+      const primer = btn.dataset.primer || "";
+      modalBody.innerHTML = defaultBody;
+
+      try {
+        const resp = await fetch("/designer/blast", {
+          method: "POST",
+          headers: { "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8" },
+          body: "primer=" + encodeURIComponent(primer)
+        });
+        const text = await resp.text();
+        if (!resp.ok) throw new Error(text || "BLAST request failed");
+        modalBody.innerHTML = text;
+      } catch (err) {
+        modalBody.innerHTML = `
+          <div class="alert alert-danger mb-0">
+            <div class="fw-semibold mb-1">BLAST failed</div>
+            <div class="small">${String(err)}</div>
+          </div>
+        `;
+      }
+    });
+  });
+
+  modalEl.addEventListener("hidden.bs.modal", () => {
+    modalBody.innerHTML = defaultBody;
+  });
+});
+</script>
 {% endblock %}

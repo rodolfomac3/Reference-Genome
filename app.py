@@ -7,17 +7,17 @@ import json
 from io import BytesIO
 from functools import lru_cache
 from typing import Dict, List, Optional, Tuple
-from flask import Flask, request, jsonify
-
+from flask import Flask, request, jsonify, send_file
 
 import pandas as pd
-from flask import Flask, render_template, request, make_response
+from flask import render_template, make_response
 from dotenv import load_dotenv
 
 # Biopython / NCBI
 from Bio import Entrez
 from Bio.Blast import NCBIWWW, NCBIXML
 from Bio.Seq import Seq
+from Bio import pairwise2  # <-- Upgrade A: lightweight alignments
 
 # SSL trust (helps on macOS if CERTIFICATE_VERIFY_FAILED)
 import ssl, certifi, urllib.request
@@ -40,7 +40,6 @@ import primer3
 _p3_calc_hairpin     = getattr(primer3, "calc_hairpin",     getattr(primer3, "calcHairpin"))
 _p3_calc_homodimer   = getattr(primer3, "calc_homodimer",   getattr(primer3, "calcHomodimer"))
 _p3_calc_heterodimer = getattr(primer3, "calc_heterodimer", getattr(primer3, "calcHeterodimer"))
-
 
 # Plotting
 import matplotlib
@@ -78,7 +77,24 @@ def _sleep():
     time.sleep(NCBI_DELAY)
 
 def sanitize_dna(seq: str) -> str:
-    return re.sub(r"[^ACGTURYKMSWBDHVN]", "", (seq or "").upper())
+    # keep ACGT plus IUPAC degeneracy codes (used throughout)
+    return re.sub(r"[^ACGTURYKMSWBDHVN\-]", "", (seq or "").upper())
+
+# -------- IUPAC / degeneracy helpers (Upgrade B) --------
+_IUPAC = {
+    "A":{"A"}, "C":{"C"}, "G":{"G"}, "T":{"T"},
+    "R":{"A","G"}, "Y":{"C","T"}, "S":{"G","C"}, "W":{"A","T"},
+    "K":{"G","T"}, "M":{"A","C"},
+    "B":{"C","G","T"}, "D":{"A","G","T"}, "H":{"A","C","T"}, "V":{"A","C","G"},
+    "N":{"A","C","G","T"},
+    "-":{"-"}  # treat gap as its own (for alignment paths)
+}
+def _iupac_match(primer_char: str, template_char: str) -> bool:
+    p = primer_char.upper(); t = template_char.upper()
+    return t in _IUPAC.get(p, {p})
+
+def _revcomp(s: str) -> str:
+    return str(Seq(s).reverse_complement())
 
 def build_download_links(ftp: str):
     if not ftp:
@@ -156,28 +172,17 @@ def _to_int(x):
     return None
 
 def _extract_genome_size_mb_from_docsum(d: dict):
-    """
-    Try multiple places in the Assembly esummary; keys can drift by record.
-    """
-    # common top-level fields
     for k in ("TotalSequenceLength", "GenomeSize", "SeqLengthSum", "UCSCSequenceLengthSum"):
         v = _to_int(d.get(k))
         if v and v > 0:
             return round(v / 1_000_000.0, 2)
-
-    # sometimes nested
     stats = d.get("AssemblyStats") or {}
     v = _to_int(stats.get("total_sequence_length") or stats.get("total_length"))
     if v and v > 0:
         return round(v / 1_000_000.0, 2)
-
     return None
 
 def _fetch_size_mb_from_ftp_stats(ftp_url: str):
-    """
-    Parse the tiny assembly_stats.txt on the FTP to get total length.
-    Works for both RefSeq and GenBank paths.
-    """
     if not ftp_url:
         return None
     try:
@@ -188,21 +193,17 @@ def _fetch_size_mb_from_ftp_stats(ftp_url: str):
             text = resp.read().decode("utf-8", errors="ignore")
         total_bp = None
         for line in text.splitlines():
-            # lines look like: "all	na	na	...	total-length	1234567"
             if "total-length" in line:
                 parts = re.split(r"\s+", line.strip())
                 for i, tok in enumerate(parts):
                     if tok == "total-length" and i + 1 < len(parts):
-                        total_bp = _to_int(parts[i + 1])
-                        break
-            if total_bp:
-                break
+                        total_bp = _to_int(parts[i + 1]); break
+            if total_bp: break
         if total_bp and total_bp > 0:
             return round(total_bp / 1_000_000.0, 2)
     except Exception:
         return None
     return None
-
 
 @lru_cache(maxsize=4096)
 def best_assembly_for_taxid_raw(taxid: str) -> List[Dict]:
@@ -229,7 +230,7 @@ def best_assembly_for_taxid_raw(taxid: str) -> List[Dict]:
         except Exception: scaffold_n50 = 0
         try: contig_n50 = int(d.get("ContigN50") or 0)
         except Exception: contig_n50 = 0
-        try:         size_mb = _extract_genome_size_mb_from_docsum(d)
+        try: size_mb = _extract_genome_size_mb_from_docsum(d)
         except Exception: size_mb = None
 
         score = 0.0
@@ -257,10 +258,6 @@ def best_assembly_for_taxid_raw(taxid: str) -> List[Dict]:
 
 # ---------- Primer Recommendations (static, for main page) ----------
 def _refs(*items):
-    """
-    Accepts strings (PMIDs/DOIs/URLs) or dicts with {label,url}.
-    Returns a list of dicts with 'label' and 'url'.
-    """
     out = []
     for r in items:
         if isinstance(r, dict) and "url" in r:
@@ -275,210 +272,46 @@ def _refs(*items):
                 out.append({"label": "Ref", "url": s})
     return out
 
-
 def suggest_markers_from_lineage(lineage: str) -> List[Dict]:
-    """
-    Returns:
-      [
-        {
-          "marker": "ITS (ITS1–ITS2)",
-          "primers": [
-            {
-              "name": "ITS1F / ITS2",
-              "fwd": "...", "rev": "...",
-              "amplicon_bp": "...",
-              "platforms": [...],
-              "use": "...",
-              "refs": [ {"label":"PMID 8486376","url":"https://pubmed.ncbi.nlm.nih.gov/8486376/"} ]
-            },
-            ...
-          ],
-          "notes": "Primary fungal barcode."
-        },
-        ...
-      ]
-    """
     lin = (lineage or "").lower()
     out: List[Dict] = []
 
     def add(marker: str, primers: List[Dict], notes: str = ""):
         out.append({"marker": marker, "primers": primers, "notes": notes})
 
-    # ---------------- Bacteria / Archaea ----------------
     if "bacteria" in lin or "archaea" in lin:
         add(
             "16S rRNA (V3–V4 / V4)",
             [
-                {
-                    "name": "341F / 805R",
-                    "fwd": "CCTACGGGNGGCWGCAG",
-                    "rev": "GACTACHVGGGTATCTAATCC",
-                    "amplicon_bp": "~460 bp (V3–V4)",
-                    "platforms": ["Illumina PE250", "Illumina PE300"],
-                    "use": "Microbiome profiling; widely used.",
-                    # Klindworth et al. 2013
-                    "refs": _refs("23344259"),
-                },
-                {
-                    "name": "515F / 806R",
-                    "fwd": "GTGCCAGCMGCCGCGGTAA",
-                    "rev": "GGACTACHVGGGTWTCTAAT",
-                    "amplicon_bp": "~291 bp (V4)",
-                    "platforms": ["Illumina PE250", "Illumina PE300", "eDNA-short"],
-                    "use": "EMP V4 standard.",
-                    # Caporaso et al. 2011
-                    "refs": _refs("21544103"),
-                },
-                {
-                    "name": "27F / 1492R",
-                    "fwd": "AGAGTTTGATCMTGGCTCAG",
-                    "rev": "GGTTACCTTGTTACGACTT",
-                    "amplicon_bp": "≈1,450 bp",
-                    "platforms": ["Sanger", "ONT/PacBio"],
-                    "use": "Full-length 16S for isolates.",
-                    # Lane 1991 (book chapter) often cited; use a general ref URL
-                    "refs": _refs({"label": "Lane 1991", "url": "https://doi.org/10.1016/B978-0-12-672180-9.50023-8"}),
-                },
+                {"name":"341F / 805R","fwd":"CCTACGGGNGGCWGCAG","rev":"GACTACHVGGGTATCTAATCC","amplicon_bp":"~460 bp (V3–V4)","platforms":["Illumina PE250","Illumina PE300"],"use":"Microbiome profiling; widely used.","refs":_refs("23344259")},
+                {"name":"515F / 806R","fwd":"GTGCCAGCMGCCGCGGTAA","rev":"GGACTACHVGGGTWTCTAAT","amplicon_bp":"~291 bp (V4)","platforms":["Illumina PE250","Illumina PE300","eDNA-short"],"use":"EMP V4 standard.","refs":_refs("21544103")},
+                {"name":"27F / 1492R","fwd":"AGAGTTTGATCMTGGCTCAG","rev":"GGTTACCTTGTTACGACTT","amplicon_bp":"≈1,450 bp","platforms":["Sanger","ONT/PacBio"],"use":"Full-length 16S for isolates.","refs":_refs({"label":"Lane 1991","url":"https://doi.org/10.1016/B978-0-12-672180-9.50023-8"})}
             ],
             "Choose region by platform/read length.",
         )
 
-    # ---------------- Fungi ----------------
     if "fungi" in lin or "fungus" in lin:
         add(
             "ITS (ITS1–ITS2)",
             [
-                {
-                    "name": "ITS1F / ITS2",
-                    "fwd": "CTTGGTCATTTAGAGGAAGTAA",
-                    "rev": "GCTGCGTTCTTCATCGATGC",
-                    "amplicon_bp": "~300–450 bp",
-                    "platforms": ["Illumina PE250", "Illumina PE300", "Sanger"],
-                    "use": "Fungal metabarcoding (ITS1).",
-                    # Gardes & Bruns 1993
-                    "refs": _refs("8486376"),
-                },
-                {
-                    "name": "ITS3 / ITS4",
-                    "fwd": "GCATCGATGAAGAACGCAGC",
-                    "rev": "TCCTCCGCTTATTGATATGC",
-                    "amplicon_bp": "~300–500 bp",
-                    "platforms": ["Illumina PE250", "Illumina PE300", "Sanger"],
-                    "use": "Fungal metabarcoding (ITS2).",
-                    # White et al. 1990
-                    "refs": _refs("1971545"),
-                },
+                {"name":"ITS1F / ITS2","fwd":"CTTGGTCATTTAGAGGAAGTAA","rev":"GCTGCGTTCTTCATCGATGC","amplicon_bp":"~300–450 bp","platforms":["Illumina PE250","Illumina PE300","Sanger"],"use":"Fungal metabarcoding (ITS1).","refs":_refs("8486376")},
+                {"name":"ITS3 / ITS4","fwd":"GCATCGATGAAGAACGCAGC","rev":"TCCTCCGCTTATTGATATGC","amplicon_bp":"~300–500 bp","platforms":["Illumina PE250","Illumina PE300","Sanger"],"use":"Fungal metabarcoding (ITS2).","refs":_refs("1971545")},
             ],
             "Primary fungal barcode.",
         )
 
-    # ---------------- Plants ----------------
-    if any(tag in lin for tag in ["viridiplantae", "plantae", "embryophyta", "streptophyta"]):
-        add(
-            "rbcL",
-            [
-                {
-                    "name": "rbcLa-F / rbcLa-R",
-                    "fwd": "ATGTCACCACAAACAGAGACTAAAGC",
-                    "rev": "GTAAAATCAAGTCCACCRCG",
-                    "amplicon_bp": "~550–600 bp",
-                    "platforms": ["Sanger", "Illumina PE300"],
-                    "use": "Core plant barcode.",
-                    # CBOL Plant Working Group 2009
-                    "refs": _refs("18431400"),
-                }
-            ],
-            "Core plant barcode.",
-        )
-        add(
-            "matK",
-            [
-                {
-                    "name": "matK-390F / matK-1326R",
-                    "fwd": "CGATCTATTCATTCAATATTTC",
-                    "rev": "TCTAGCACACGAAAGTCGAAGT",
-                    "amplicon_bp": "~900 bp",
-                    "platforms": ["Sanger", "ONT/PacBio"],
-                    "use": "Higher resolution with rbcL.",
-                    # CBOL Plant Working Group 2009
-                    "refs": _refs("18431400"),
-                }
-            ],
-            "Use with rbcL.",
-        )
-        add(
-            "trnL (P6 mini)",
-            [
-                {
-                    "name": "g / h",
-                    "fwd": "GGGCAATCCTGAGCCAA",
-                    "rev": "CCATTGAGTCTCTGCACCTATC",
-                    "amplicon_bp": "~10–150 bp",
-                    "platforms": ["eDNA-short", "Illumina PE250"],
-                    "use": "Degraded DNA/eDNA.",
-                    # Taberlet et al. 1996
-                    "refs": _refs("9336234"),
-                }
-            ],
-            "Short eDNA-friendly locus.",
-        )
+    if any(tag in lin for tag in ["viridiplantae","plantae","embryophyta","streptophyta"]):
+        add("rbcL",[{"name":"rbcLa-F / rbcLa-R","fwd":"ATGTCACCACAAACAGAGACTAAAGC","rev":"GTAAAATCAAGTCCACCRCG","amplicon_bp":"~550–600 bp","platforms":["Sanger","Illumina PE300"],"use":"Core plant barcode.","refs":_refs("18431400")}],"Core plant barcode.")
+        add("matK",[{"name":"matK-390F / matK-1326R","fwd":"CGATCTATTCATTCAATATTTC","rev":"TCTAGCACACGAAAGTCGAAGT","amplicon_bp":"~900 bp","platforms":["Sanger","ONT/PacBio"],"use":"Higher resolution with rbcL.","refs":_refs("18431400")}],"Use with rbcL.")
+        add("trnL (P6 mini)",[{"name":"g / h","fwd":"GGGCAATCCTGAGCCAA","rev":"CCATTGAGTCTCTGCACCTATC","amplicon_bp":"~10–150 bp","platforms":["eDNA-short","Illumina PE250"],"use":"Degraded DNA/eDNA.","refs":_refs("9336234")}],"Short eDNA-friendly locus.")
 
-    # ---------------- Animals ----------------
     if "metazoa" in lin or "animalia" in lin:
-        add(
-            "COI (Folmer region)",
-            [
-                {
-                    "name": "LCO1490 / HCO2198",
-                    "fwd": "GGTCAACAAATCATAAAGATATTGG",
-                    "rev": "TAAACTTCAGGGTGACCAAAAAATCA",
-                    "amplicon_bp": "~650 bp",
-                    "platforms": ["Sanger", "Illumina PE300", "ONT/PacBio"],
-                    "use": "Standard animal barcode.",
-                    # Folmer et al. 1994
-                    "refs": _refs("7881515"),
-                }
-            ],
-            "Standard animal barcode.",
-        )
-        add(
-            "12S (eDNA vertebrates)",
-            [
-                {
-                    "name": "MiFish-U",
-                    "fwd": "GTCGGTAAAACTCGTGCCAGC",
-                    "rev": "CATAGTGGGGTATCTAATCCCAGTTTG",
-                    "amplicon_bp": "~170 bp",
-                    "platforms": ["eDNA-short", "Illumina PE250"],
-                    "use": "Vertebrate eDNA surveys.",
-                    # MiFish (Miya et al. 2015) – DOI
-                    "refs": _refs("10.1093/gigascience/giy123"),
-                }
-            ],
-            "Great for vertebrate eDNA.",
-        )
+        add("COI (Folmer region)",[{"name":"LCO1490 / HCO2198","fwd":"GGTCAACAAATCATAAAGATATTGG","rev":"TAAACTTCAGGGTGACCAAAAAATCA","amplicon_bp":"~650 bp","platforms":["Sanger","Illumina PE300","ONT/PacBio"],"use":"Standard animal barcode.","refs":_refs("7881515")}],"Standard animal barcode.")
+        add("12S (eDNA vertebrates)",[{"name":"MiFish-U","fwd":"GTCGGTAAAACTCGTGCCAGC","rev":"CATAGTGGGGTATCTAATCCCAGTTTG","amplicon_bp":"~170 bp","platforms":["eDNA-short","Illumina PE250"],"use":"Vertebrate eDNA surveys.","refs":_refs("10.1093/gigascience/giy123")}],"Great for vertebrate eDNA.")
 
-    # ---------------- Other eukaryotes ----------------
-    if "eukaryota" in lin and not any(k in lin for k in ["animalia", "plantae", "fungi"]):
-        add(
-            "18S rRNA (V4 / V9)",
-            [
-                {
-                    "name": "18S V4 (general)",
-                    "fwd": "CCAGCASCYGCGGTAATTCC",
-                    "rev": "ACTTTCGTTCTTGATYRA",
-                    "amplicon_bp": "~380–420 bp (V4)",
-                    "platforms": ["Illumina PE250", "Illumina PE300", "Sanger"],
-                    "use": "Pan-eukaryote survey.",
-                    # Stoeck et al. 2010 (V4) – DOI
-                    "refs": _refs("10.1111/j.1365-294X.2010.04695.x"),
-                }
-            ],
-            "Pan-eukaryotic survey marker.",
-        )
-
+    if "eukaryota" in lin and not any(k in lin for k in ["animalia","plantae","fungi"]):
+        add("18S rRNA (V4 / V9)",[{"name":"18S V4 (general)","fwd":"CCAGCASCYGCGGTAATTCC","rev":"ACTTTCGTTCTTGATYRA","amplicon_bp":"~380–420 bp (V4)","platforms":["Illumina PE250","Illumina PE300","Sanger"],"use":"Pan-eukaryote survey.","refs":_refs("10.1111/j.1365-294X.2010.04695.x")}],"Pan-eukaryotic survey marker.")
     return out
-
 
 def quick_blast_guess(seq: str, program: str = "blastn", db: str = "nt", hitlist_size: int = 5):
     seq = sanitize_dna(seq)
@@ -497,6 +330,99 @@ def quick_blast_guess(seq: str, program: str = "blastn", db: str = "nt", hitlist
             "identity": round(100 * hsp.identities / max(1, hsp.align_length), 2),
         })
     return pd.DataFrame(hits)
+
+# ------------ Alignment & entropy (Upgrade A) ------------
+def _align_to_ref_pairwise2(ref: str, seq: str) -> Tuple[str, str]:
+    """
+    Global alignment of seq to ref (ACGTN, gaps allowed). Returns (ref_aln, seq_aln) with equal length.
+    Scoring tuned light: match=2, mismatch=-1, gap open=-4, gap extend=-0.5
+    """
+    if not ref or not seq:
+        return ref, seq
+    alignments = pairwise2.align.globalms(ref, seq, 2, -1, -4, -0.5, one_alignment_only=True)
+    if not alignments:
+        return ref, seq
+    a = alignments[0]
+    return a.seqA, a.seqB
+
+def _multiple_to_ref_alignment(seqs: List[Dict]) -> List[Dict]:
+    """
+    Align every sequence to the first sequence as reference.
+    Returns records with 'id' and 'seq' replaced by aligned versions (gaps '-').
+    """
+    if not seqs:
+        return []
+    ref = sanitize_dna(seqs[0]["seq"])
+    out = [{"id": seqs[0]["id"], "seq": ref}]
+    for s in seqs[1:]:
+        a_ref, a_q = _align_to_ref_pairwise2(ref, sanitize_dna(s["seq"]))
+        # pad reference of the first added if alignment extended
+        if len(a_ref) != len(out[0]["seq"]):
+            # re-map all existing aligned seqs to new ref with additional gaps
+            new_ref = a_ref
+            # build a mapping from old ref to new ref positions via pairwise2 again
+            # But simpler: realign previous ref to new_ref and project gaps into all out sequences
+            prev_ref = out[0]["seq"]
+            pr2, nr2 = _align_to_ref_pairwise2(new_ref, prev_ref)  # align prev_ref to new_ref
+            # inject gaps into each sequence in out, following alignment of prev_ref to new_ref
+            gap_positions = [i for i,(x,y) in enumerate(zip(pr2, nr2)) if x!='-' and y=='-']
+            keep_positions = [i for i,(x,y) in enumerate(zip(pr2, nr2)) if x!='-']
+            # rebuild each existing seq by inserting '-' where prev_ref has gaps relative to new_ref
+            rebuilt = []
+            for rec in out:
+                s_old = rec["seq"]
+                # expand s_old over keep_positions and insert '-' at gap positions
+                res_chars = []
+                idx_old = 0
+                for i,(x,y) in enumerate(zip(pr2, nr2)):
+                    if x=='-' and y!='-':
+                        res_chars.append('-')
+                    elif x!='-' and y=='-':
+                        # should not happen with our construction
+                        res_chars.append('-')
+                    else:
+                        # x != '-' and y != '-': consume from s_old
+                        res_chars.append(s_old[idx_old] if idx_old < len(s_old) else '-')
+                        idx_old += 1
+                rebuilt.append({"id": rec["id"], "seq": "".join(res_chars)})
+            out = rebuilt
+            # finally set new ref in slot 0
+            out[0]["seq"] = new_ref
+            ref = new_ref
+            # Now align current seq to new ref again to keep in same coordinate space
+            a_ref, a_q = _align_to_ref_pairwise2(ref, sanitize_dna(s["seq"]))
+        out.append({"id": s["id"], "seq": a_q})
+    return out
+
+def entropy_series(seqs: List[Dict]) -> List[float]:
+    """
+    Shannon entropy per aligned column (Upgrade A).
+    If sequences are unaligned (varying length without gaps), align them first to the first sequence.
+    """
+    if not seqs:
+        return []
+    # If any seq lacks gaps and lengths differ, perform alignment
+    needs_align = (len({len(r["seq"]) for r in seqs}) != 1) or any('-' in r["seq"] for r in seqs)
+    aligned = _multiple_to_ref_alignment(seqs) if needs_align else seqs
+    L = min(len(s["seq"]) for s in aligned)
+    if L == 0:
+        return []
+    from math import log2
+    ent = []
+    for i in range(L):
+        col = [s["seq"][i] for s in aligned]
+        # ignore gaps in entropy (only A/C/G/T)
+        bases = [b for b in col if b in "ACGT"]
+        if not bases:
+            ent.append(0.0); continue
+        total = len(bases)
+        H = 0.0
+        for b in "ACGT":
+            p = bases.count(b)/total
+            if p > 0:
+                H -= p * log2(p)
+        ent.append(round(H, 3))
+    return ent
 
 # ------------ Shared context builder (used by /search and exports) ------------
 def build_context_from_request(form):
@@ -548,7 +474,6 @@ def build_context_from_request(form):
                 mb = _fetch_size_mb_from_ftp_stats(best_row.get("ftp") or "")
                 if mb:
                     best_row["size_mb"] = mb
-                    # also update the row in ranked so the table shows it
                     for r in ranked:
                         if r["assembly_accession"] == best_row["assembly_accession"]:
                             r["size_mb"] = mb
@@ -568,13 +493,53 @@ def build_context_from_request(form):
 # =================== Primer Wizard helpers ===================
 
 LOCUS_ALIASES = {
-    "COI": ['COI', 'cox1', '"cytochrome c oxidase subunit I"'],
-    "12S": ['12S'],
-    "16S": ['16S'],
-    "ITS": ['ITS', '"internal transcribed spacer"'],
-    "18S": ['18S'],
-    "rbcL": ['rbcL'],
-    "matK": ['matK'],
+    "COI": [
+        "COI",
+        "cox1",
+        '"cytochrome c oxidase subunit I"',
+        '"cytochrome oxidase subunit I"'
+    ],
+    "12S": [
+        "12S",
+        '"12S ribosomal RNA"',
+        '"12S rRNA"',
+        "MT-RNR1",
+        '"mitochondrial small subunit rRNA"'
+    ],
+    "16S": [
+        "16S",
+        '"16S ribosomal RNA"',
+        '"16S rRNA"',
+        "rrs",
+        "rrsA",
+        '"small subunit ribosomal RNA"'
+    ],
+    "ITS": [
+        "ITS",
+        '"internal transcribed spacer"',
+        "ITS1",
+        "ITS2",
+        '"ribosomal DNA spacer"',
+        '"rDNA ITS"'
+    ],
+    "18S": [
+        "18S",
+        '"18S ribosomal RNA"',
+        '"18S rRNA"',
+        '"small subunit ribosomal RNA"'
+    ],
+    "rbcL": [
+        "rbcL",
+        '"ribulose-1,5-bisphosphate carboxylase large subunit"',
+        '"RuBisCO large subunit"',
+        '"ribulose bisphosphate carboxylase large chain"'
+    ],
+    "matK": [
+        "matK",
+        '"maturase K"',
+        '"chloroplast maturase K"',
+        '"cpDNA matK"'
+    ]
 }
 
 CODING_LOCI = {"COI", "rbcL", "matK"}  # AA overlay available for these
@@ -613,40 +578,41 @@ def fetch_ncbi_sequences_for_locus(taxon_name: str, locus: str, retmax: int = 10
         return []
     taxid = tax["taxid"]
     locus_q = locus_query_string(locus)
-    term = f'{locus_q} AND txid{taxid}[Organism:exp] AND (biomol_genomic[PROP] OR biomol_mRNA[PROP])'
+
+    # Length window: avoid whole genomes; keeps genuine gene/rRNA fragments
+    len_clause = "80:5000[SLEN]"
+
+    # Choose biomolecule filter by locus class
+    L = (locus or "").strip().upper()
+    if L in ("16S", "18S", "ITS"):
+        # For rRNA/ITS, restrict to rRNA molecules; exclude obvious genome titles
+        biomol_clause = "biomol_rRNA[PROP]"
+        not_genome = "NOT complete genome[Title]"
+        term = f"({locus_q}) AND txid{taxid}[Organism:exp] AND {biomol_clause} AND {len_clause} {not_genome}"
+    else:
+        # Coding loci (COI, rbcL, matK, etc.) — allow genomic/mRNA, still length-limit
+        biomol_clause = "(biomol_genomic[PROP] OR biomol_mRNA[PROP])"
+        term = f"({locus_q}) AND txid{taxid}[Organism:exp] AND {biomol_clause} AND {len_clause}"
+
     _sleep()
     h = Entrez.esearch(db="nucleotide", term=term, retmax=retmax, retmode="xml")
     rec = _entrez_read(h)
     ids = rec.get("IdList", [])
     if not ids:
         return []
+
     _sleep()
     h2 = Entrez.efetch(db="nucleotide", id=",".join(ids), rettype="fasta", retmode="text")
     fasta_txt = h2.read()
     h2.close()
+
     seqs = parse_fasta_string(fasta_txt)
+    # Keep a wide but reasonable range; len_clause already filters most out
     seqs = [s for s in seqs if 80 <= len(s["seq"]) <= 8000]
     return seqs
 
-def entropy_series(seqs):
-    if not seqs:
-        return []
-    L = min(len(s["seq"]) for s in seqs)
-    if L == 0:
-        return []
-    from math import log2
-    ent = []
-    for i in range(L):
-        col = [s["seq"][i] for s in seqs]
-        counts = {b: col.count(b) for b in "ACGT"}
-        total = sum(counts.values()) or 1
-        H = 0.0
-        for b in "ACGT":
-            p = counts[b] / total
-            if p > 0:
-                H -= p * log2(p)
-        ent.append(round(H, 3))
-    return ent
+
+
 
 # ---------- QC utilities (#1 & #3) ----------
 def _gc_clamp_ok(seq: str, min_gc3: int, max_gc3: int, clamp_span: int = 3) -> Tuple[int, bool]:
@@ -682,7 +648,6 @@ def _homopolymer_ok(seq: str, max_at: int, max_gc: int) -> bool:
     return ok
 
 def _dinuc_ok(seq: str, max_repeats: int) -> bool:
-    # disallow > max_repeats of any dinucleotide like ATATAT...
     if len(seq) < 4:
         return True
     for i in range(len(seq)-3):
@@ -697,7 +662,6 @@ def _dinuc_ok(seq: str, max_repeats: int) -> bool:
     return True
 
 def _thermo_dGs(left: str, right: str, mv: float, dv: float, dntp: float, dna_nM: float) -> Dict[str, float]:
-    # Same arguments as before; just calling the compat aliases.
     kwargs = dict(mv_conc=mv, dv_conc=dv, dntp_conc=dntp, dna_conc=dna_nM, temp_c=60)
     try:
         hpL = _p3_calc_hairpin(left, **kwargs);  dg_hpL = float(getattr(hpL, "dg", 0.0) or 0.0)
@@ -727,9 +691,7 @@ def _thermo_dGs(left: str, right: str, mv: float, dv: float, dntp: float, dna_nM
         "dg_hetero": dg_het,
     }
 
-
 def _dG_pass(dgs: Dict[str,float], th_hp: float, th_self: float, th_hetero: float) -> bool:
-    # thresholds are minimum acceptable (e.g., -2, -6, -7); we want dg >= threshold (less negative is better)
     return (
         dgs["dg_hp_left"]   >= th_hp and
         dgs["dg_hp_right"]  >= th_hp and
@@ -738,25 +700,41 @@ def _dG_pass(dgs: Dict[str,float], th_hp: float, th_self: float, th_hetero: floa
         dgs["dg_hetero"]    >= th_hetero
     )
 
+# ---- Degenerate 3'-kmer uniqueness (Upgrade B) ----
+def _degenerate_match_count(kmer: str, hay: str) -> int:
+    """Count occurrences of IUPAC kmer in hay (no RC here)."""
+    k = len(kmer)
+    if k == 0: return 0
+    c = 0
+    for i in range(0, len(hay)-k+1):
+        seg = hay[i:i+k]
+        ok = True
+        for a,b in zip(kmer, seg):
+            if not _iupac_match(a, b):
+                ok = False; break
+        if ok: c += 1
+    return c
+
 def _kmer_uniqueness_3p(primer: str, seqs: List[Dict], k: int = 11) -> int:
-    """Count exact matches of the 3'-terminal k-mer across all sequences (both strands). Lower is better."""
+    """Count IUPAC-compatible matches of 3'-terminal k-mer across all sequences (+ and RC)."""
     if not primer or k <= 0 or len(primer) < k:
         return 0
     kmer = primer[-k:].upper()
-    rc_kmer = str(Seq(kmer).reverse_complement())
+    rc_kmer = _revcomp(kmer)
     count = 0
     for s in seqs:
         t = s["seq"]
-        count += t.count(kmer) + t.count(rc_kmer)
-        rc = str(Seq(t).reverse_complement())
-        count += rc.count(kmer) + rc.count(rc_kmer)
+        rc = _revcomp(t)
+        count += _degenerate_match_count(kmer, t)
+        count += _degenerate_match_count(kmer, rc)
+        count += _degenerate_match_count(rc_kmer, t)
+        count += _degenerate_match_count(rc_kmer, rc)
     return count
 
 # --- Region constraints from entropy (auto windows) ---
 def _ok_region_pairs_from_entropy(seqs: List[Dict], f_span: int = 60, r_span: int = 60,
                                   max_entropy: float = 0.6, max_pairs: int = 4) -> Optional[str]:
-    """Build SEQUENCE_PRIMER_PAIR_OK_REGION_LIST from low-entropy windows.
-       Forward windows taken from first ~40% of alignment, reverse from last ~60%."""
+    """Build SEQUENCE_PRIMER_PAIR_OK_REGION_LIST from low-entropy windows on aligned sequences (Upgrade A)."""
     if not seqs:
         return None
     ent = entropy_series(seqs)
@@ -766,10 +744,8 @@ def _ok_region_pairs_from_entropy(seqs: List[Dict], f_span: int = 60, r_span: in
     if L < (f_span + r_span + 10):
         return None
 
-    import numpy as np
     ent_arr = np.array(ent, dtype=float)
 
-    # scan windows
     def scan_windows(start, end, span):
         best = []
         for i in range(start, max(start, end - span + 1)):
@@ -781,13 +757,11 @@ def _ok_region_pairs_from_entropy(seqs: List[Dict], f_span: int = 60, r_span: in
         best.sort(key=lambda x: (x[0], x[1]))
         return best
 
-    # choose zones
     f_end = int(L * 0.45)
     r_start = int(L * 0.35)
     f_cands = scan_windows(0, f_end, f_span)[:max_pairs * 2]
     r_cands = scan_windows(r_start, L - r_span, r_span)[:max_pairs * 2]
 
-    # filter by entropy threshold if possible
     f_cands = [c for c in f_cands if c[0] <= max_entropy] or f_cands
     r_cands = [c for c in r_cands if c[0] <= max_entropy] or r_cands
 
@@ -800,9 +774,8 @@ def _ok_region_pairs_from_entropy(seqs: List[Dict], f_span: int = 60, r_span: in
 
     return " ".join(pairs) if pairs else None
 
-# ---------- Primer design (enhanced) ----------
+# ---------- Primer design ----------
 def _pairwise_combine_from_lists(res: Dict, amp_min: int, amp_max: int, amplicon_opt: int) -> List[Dict]:
-    """When PRIMER_TASK=pick_primer_list, pair left/right lists greedily."""
     out = []
     nL = int(res.get("PRIMER_LEFT_NUM_RETURNED", 0) or 0)
     nR = int(res.get("PRIMER_RIGHT_NUM_RETURNED", 0) or 0)
@@ -826,11 +799,8 @@ def _pairwise_combine_from_lists(res: Dict, amp_min: int, amp_max: int, amplicon
                 "tm": res.get(f"PRIMER_RIGHT_{j}_TM", 0.0),
                 "gc": res.get(f"PRIMER_RIGHT_{j}_GC_PERCENT", 0.0)
             })
-    # greedy pairing: for each left, find a right that yields a plausible product
     for L in lefts:
         for R in rights:
-            # Primer3 stores RIGHT position as the 3' index from leftmost base.
-            # Approximate product size:
             prod = (R["pos"] - L["pos"]) + 1
             if prod < amp_min or prod > amp_max:
                 continue
@@ -842,7 +812,6 @@ def _pairwise_combine_from_lists(res: Dict, amp_min: int, amp_max: int, amplicon
                 'amplicon_len': prod, 'penalty': 0.0,
                 'left_pos': L["pos"], 'right_pos': R["pos"]
             })
-    # rank by distance to optimal product and balance of Tm
     out.sort(key=lambda r: (abs((r['amplicon_len'] or amplicon_opt) - amplicon_opt),
                             abs(r['tm_left'] - r['tm_right'])))
     return out[:300]
@@ -867,25 +836,20 @@ def design_primers_on_region(
     dntp_mM: float,
     dna_nM: float,
     num_return: int = 30,
-    candidate_mode: str = "pairs",             # "pairs" or "list"
+    candidate_mode: str = "pairs",
     min_three_prime_dist: int = 5,
-    ok_region_pairs: Optional[str] = None      # "fstart,flen,rstart,rlen ..." (Primer3 format)
+    ok_region_pairs: Optional[str] = None
 ) -> List[Dict]:
     seq = sanitize_dna(seq)
     if not seq:
         return []
     target_len = max(1, min(len(seq), target_len or len(seq)))
 
-    params = {
-        'SEQUENCE_ID': 'target',
-        'SEQUENCE_TEMPLATE': seq,
-        
-    }
+    params = { 'SEQUENCE_ID': 'target', 'SEQUENCE_TEMPLATE': seq }
     use_target = bool(target_len) and (target_len < len(seq))
     if use_target:
         params['SEQUENCE_TARGET'] = [max(0, int(target_start)), int(target_len)]
 
-    
     opts = {
         'PRIMER_TASK': 'generic' if candidate_mode == "pairs" else 'pick_primer_list',
         'PRIMER_PICK_LEFT_PRIMER': 1,
@@ -897,22 +861,14 @@ def design_primers_on_region(
         'PRIMER_PRODUCT_OPT_SIZE': amplicon_opt,
         'PRIMER_MIN_TM': tm_min, 'PRIMER_OPT_TM': tm_opt, 'PRIMER_MAX_TM': tm_max,
         'PRIMER_MIN_GC': gc_min, 'PRIMER_MAX_GC': gc_max,
-        'PRIMER_MAX_POLY_X': 100,  # we enforce homopolymers custom per-base (A/T vs G/C)
+        'PRIMER_MAX_POLY_X': 100,
         'PRIMER_MAX_SELF_ANY_TH': 45.0,
         'PRIMER_MAX_SELF_END_TH': 35.0,
         'PRIMER_MAX_HAIRPIN_TH': 47.0,
         'PRIMER_NUM_RETURN': int(num_return),
-
-        # enforce uniqueness/spacing at 3' ends (reduces near-duplicate pairs)
         'PRIMER_MIN_THREE_PRIME_DISTANCE': int(min_three_prime_dist),
-
-        # Avoid Ns in primer sequence
         'PRIMER_MAX_NS_ACCEPTED': 0,
-
-        # Explanation flags
         'PRIMER_EXPLAIN_FLAG': 1,
-
-        # Thermo environment
         'PRIMER_SALT_MONOVALENT': mv_mM,
         'PRIMER_SALT_DIVALENT': dv_mM,
         'PRIMER_DNTP_CONC': dntp_mM,
@@ -926,7 +882,6 @@ def design_primers_on_region(
     if candidate_mode == "list":
         return _pairwise_combine_from_lists(res, amplicon_min, amplicon_max, amplicon_opt)
 
-    # default: paired output from Primer3 (generic)
     out = []
     n = res.get('PRIMER_PAIR_NUM_RETURNED', 0)
     for i in range(n):
@@ -950,43 +905,99 @@ def design_primers_on_region(
     out.sort(key=lambda r: (r['penalty'], abs((r['amplicon_len'] or amplicon_opt) - amplicon_opt)))
     return out
 
-def insilico_coverage(primer_left: str, primer_right: str, seqs, max_mismatch=1):
+# ---------- Degenerate-aware in-silico coverage (Upgrade B) ----------
+def _degenerate_primer_hits_on_strand(primer: str, template: str, max_mismatch: int, require_3prime_match: bool) -> List[int]:
+    """
+    Return list of start indices where primer matches template (IUPAC-aware).
+    If require_3prime_match=True, enforce last base exact compatibility.
+    """
+    p = primer.upper(); t = template.upper()
+    Lp = len(p); Lt = len(t)
+    hits = []
+    if Lp == 0 or Lt < Lp:
+        return hits
+    for i in range(0, Lt - Lp + 1):
+        seg = t[i:i+Lp]
+        # enforce 3' base compatibility
+        if require_3prime_match and not _iupac_match(p[-1], seg[-1]):
+            continue
+        # count mismatches under IUPAC compatibility
+        mm = 0
+        ok = True
+        for a,b in zip(p, seg):
+            if not _iupac_match(a, b):
+                mm += 1
+                if mm > max_mismatch:
+                    ok = False; break
+        if ok:
+            hits.append(i)
+    return hits
+
+def insilico_coverage(
+    primer_left: str,
+    primer_right: str,
+    seqs: List[Dict],
+    max_mismatch: int = 1,
+    amp_min: int = 80,
+    amp_max: int = 800,
+    require_3prime_match: bool = True
+):
+    """
+    Orientation-correct PCR check with IUPAC degeneracy (Upgrade B).
+    - Forward primer matches + strand
+    - Reverse primer matches rev-comp(+ strand) i.e., reverse-complemented template on + strand
+    - Product size measured between outer 5' ends of primer footprints on + strand
+    """
     if not seqs:
         return {"hits":0, "total":0, "pct":0.0}
-    left = primer_left.upper()
-    right = primer_right.upper()
+
+    L = primer_left.upper()
+    R = primer_right.upper()
+    Rc = _revcomp(R)
+
     hits = 0
+    total = 0
+
     for s in seqs:
-        t = s["seq"]
-        if len(t) < 80:
+        t = s["seq"].upper()
+        if len(t) < max(len(L), len(R)):
             continue
-        # forward primer
-        found_left = False
-        for i in range(0, len(t)-len(left)+1):
-            seg = t[i:i+len(left)]
-            if seg[-1] != left[-1]:  # 3' protection
-                continue
-            mism = sum(1 for a,b in zip(left, seg) if a != b)
-            if mism <= max_mismatch:
-                found_left = True
-                break
-        if not found_left:
+        total += 1
+
+        # All forward matches for left on + strand
+        left_pos_list = _degenerate_primer_hits_on_strand(L, t, max_mismatch, require_3prime_match)
+
+        if not left_pos_list:
             continue
-        # reverse primer on reverse complement
-        rc = str(Seq(t).reverse_complement())
-        found_right = False
-        for i in range(0, len(rc)-len(right)+1):
-            seg = rc[i:i+len(right)]
-            if seg[-1] != right[-1]:
-                continue
-            mism = sum(1 for a,b in zip(right, seg) if a != b)
-            if mism <= max_mismatch:
-                found_right = True
+
+        # All matches for reverse primer's reverse-complement on + strand (i.e., binding to - strand)
+        right_pos_list = _degenerate_primer_hits_on_strand(Rc, t, max_mismatch, require_3prime_match)
+
+        if not right_pos_list:
+            continue
+
+        # Decide if any pair forms a valid amplicon (left 5' -> right 5' downstream)
+        L_len = len(L)
+        R_len = len(Rc)
+        pair_ok = False
+        for iL in left_pos_list:
+            left_5p = iL  # 5' of forward is its start
+            # right primer binds downstream; its 5' on + strand is at (iR + R_len - 1) going left->right orientation
+            for iR in right_pos_list:
+                right_5p = iR + R_len - 1
+                if right_5p <= left_5p:
+                    continue
+                prod = (right_5p - left_5p + 1)
+                if amp_min <= prod <= amp_max:
+                    pair_ok = True
+                    break
+            if pair_ok:
                 break
-        if found_left and found_right:
+
+        if pair_ok:
             hits += 1
-    total = len([s for s in seqs if len(s["seq"]) >= 80])
-    pct = round(100.0 * hits / total, 2) if total else 0.0
+
+    pct = round(100.0 * hits / max(total, 1), 2)
     return {"hits": hits, "total": total, "pct": pct}
 
 # === Visualization helpers ===
@@ -997,34 +1008,37 @@ def _encode_fig_to_b64(fig, dpi=140):
     buf.seek(0)
     return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
 
-def make_entropy_plot(seqs, designed, locus: str, gc_window: int = 21, entropy_threshold: float = 0.60):
+def make_entropy_plot(
+    seqs, designed, locus: str,
+    gc_window: int = 21,
+    entropy_threshold: float = 0.60,
+    max_pairs_on_plot: int = 3
+):
     """
-    Entropy bar plot with:
-      • rolling GC% on twin y-axis
-      • coverage-weighted arrow width
-      • penalty-tinted labels
-      • micro pass/fail chips for GC-clamp, ΔG, k-mer uniqueness
-      • faint entropy threshold line
+    Conservation plot with dynamic bottom margin:
+      • Smoothed entropy + rolling GC%
+      • Shade ONLY best amplicon
+      • Up to `max_pairs_on_plot` lane rows (P1..)
+      • Bottom padding scales with lanes + AA track so nothing overlaps
     """
     if not seqs:
         return None
 
-    from matplotlib import cm, colors
-    from matplotlib.patches import Rectangle
+    from matplotlib import colors
     from matplotlib.transforms import blended_transform_factory
 
-    # --- entropy series (existing helper) ---
     ent = entropy_series(seqs)
     if not ent:
         return None
-    L = len(ent)
-    x = np.arange(L)
 
-    # --- coverage-wide GC% across alignment (rolling window) ---
-    # compute per-position GC fraction over all sequences (ignore Ns)
+    L = len(ent)
+    x = np.arange(L, dtype=float)
+
+    # ---- rolling GC% (ignore gaps) ----
     denom = np.zeros(L, dtype=float)
     gc_ct = np.zeros(L, dtype=float)
-    for s in seqs:
+    aligned = _multiple_to_ref_alignment(seqs)
+    for s in aligned:
         t = s["seq"][:L]
         for i, b in enumerate(t):
             if b in "ACGT":
@@ -1032,160 +1046,146 @@ def make_entropy_plot(seqs, designed, locus: str, gc_window: int = 21, entropy_t
                 if b in "GC":
                     gc_ct[i] += 1.0
     gc_frac = np.divide(gc_ct, np.maximum(denom, 1.0))
-    if gc_window and gc_window > 1:
-        k = np.ones(gc_window, dtype=float) / gc_window
-        gc_roll = np.convolve(gc_frac, k, mode="same")
-    else:
-        gc_roll = gc_frac
 
-    # --- figure & primary axis (entropy) ---
-    fig, ax = plt.subplots(figsize=(13.5, 3.8))
-    ax.bar(x, ent, width=1.0, color="#66c2d0")
-    ax.set_ylim(0, max(1.8, max(ent) + 0.1))
+    def smooth(y, w):
+        if w <= 1: return np.asarray(y, dtype=float)
+        k = np.ones(w, dtype=float) / w
+        return np.convolve(np.asarray(y, dtype=float), k, mode="same")
+
+    ent_smooth = smooth(ent, 5 if L > 300 else 3)
+    gc_roll = smooth(gc_frac * 100.0, gc_window if gc_window and gc_window > 1 else 1)
+
+    # ---- dynamic bottom margin based on lanes & AA track ----
+    n_lanes = min(max_pairs_on_plot, len(designed or []))
+    want_aa = (locus in CODING_LOCI and L >= 3 and bool(seqs))
+
+    # More generous spacing so lane labels never touch ticks
+    base = 0.22          # space for x-label + tick labels
+    per_lane = 0.10      # per-lane space (height + gap)
+    aa_extra = 0.10 if want_aa else 0.0
+
+    bottom_margin = base + n_lanes * per_lane + aa_extra
+    bottom_margin = min(0.48, bottom_margin)
+
+    fig, ax = plt.subplots(figsize=(14.4, 4.8))
+    fig.subplots_adjust(left=0.065, right=0.97, top=0.94, bottom=bottom_margin)
+
     ax.set_xlim(0, L)
+    ax.set_ylim(0, max(1.8, float(np.max(ent)) + 0.1))
     ax.set_ylabel("Entropy", fontsize=10)
-    ax.set_xlabel("Position (bp)", fontsize=10)
-    ax.set_xticks(np.arange(0, L + 1, 50))
+    ax.set_xlabel("Position (bp)", fontsize=10, labelpad=16)
+    ax.set_xticks(np.arange(0, L + 1, 50 if L <= 1200 else 100))
     ax.grid(axis='y', alpha=0.15)
 
-    # faint threshold line
+    # entropy trace
+    if L <= 600:
+        ax.bar(x, ent, width=1.0, color="#66c2d0", alpha=0.55, linewidth=0)
+        ax.plot(x, ent_smooth, linewidth=1.2, alpha=0.9, color="#2286a7")
+    else:
+        ax.plot(x, ent_smooth, linewidth=1.0, alpha=0.95, color="#66c2d0")
+
+    # threshold
     if entropy_threshold is not None:
-     ax.axhline(entropy_threshold, color="#ef4444", linestyle="--", linewidth=1, alpha=0.22)
-     ax.text(0.005, entropy_threshold + 0.03, f"H={entropy_threshold:.2f}",
-            transform=ax.get_yaxis_transform(), fontsize=8, color="#ef4444", alpha=0.7,
-            ha="left", va="bottom")
+        ax.axhline(entropy_threshold, color="#ef4444", linestyle="--", linewidth=1, alpha=0.22)
+        ax.text(0.005, entropy_threshold + 0.03, f"H={entropy_threshold:.2f}",
+                transform=ax.get_yaxis_transform(), fontsize=8, color="#ef4444", alpha=0.7,
+                ha="left", va="bottom")
 
-
-    # --- twin axis: rolling GC% ---
+    # GC% (right axis)
     ax2 = ax.twinx()
-    ax2.plot(x, gc_roll * 100.0, linewidth=1.6, alpha=0.65, color="#9aa5b1", label=f"GC% (rolling {gc_window})")
+    ax2.plot(x, gc_roll, linewidth=1.25, alpha=0.6, color="#9aa5b1")
     ax2.set_ylim(0, 100)
     ax2.set_ylabel("GC % (rolling)", fontsize=9, color="#9aa5b1")
     ax2.tick_params(axis='y', labelsize=8, colors="#9aa5b1")
 
-    # helper: clamp x to axis range
+    # helpers
     def clamp_x(v):
         if v is None: return 0
         if v < 0: return 0
         if v > L - 1: return L - 1
         return v
 
-    # color by penalty
-    norm = colors.Normalize(vmin=0.0, vmax=3.0)  # typical primer3 penalties
-    cmap = cm.get_cmap("RdYlGn_r")
-
-    # blended transform for micro chips: x in data, y in axes fraction
     trans = blended_transform_factory(ax.transData, ax.transAxes)
 
-    # --- overlay up to 5 designed pairs ---
-    for idx, d in enumerate((designed or [])[:5], start=1):
-        lp = int(d.get("left_pos", 0) or 0)
-        ll = int(d.get("len_left", 0) or 0)
-        rp = int(d.get("right_pos", 0) or 0)
-        rl = int(d.get("len_right", 0) or 0)
-        amp = int(d.get("amplicon_len", 0) or 0)
-        pen = float(d.get("penalty", 0.0) or 0.0)
+    # Show only top N in lanes; shade the best amplicon
+    shown = (designed or [])[:n_lanes]
+    best = designed[0] if designed else None
 
-        cov_pct = float(d.get("coverage_pct", 0.0) or 0.0)
-        lw = 1.3 + 3.2 * max(0.0, min(1.0, cov_pct / 100.0))  # coverage-weight arrow width
-
-        # clamp for drawing
-        f_x0 = clamp_x(lp)
-        f_x1 = clamp_x(lp + ll)
-        r_x0 = clamp_x(rp)
-        r_x1 = clamp_x(rp + rl)
-
-        # amplicon shade (between forward end and reverse start; fallback to product size if reversed)
-        span_start = f_x1
-        span_end = rp
-        if span_end <= span_start and amp > 0:
-            span_end = span_start + amp
-        span_end = clamp_x(span_end)
+    if best:
+        lp = int(best.get("left_pos", 0) or 0)
+        ll = int(best.get("len_left", 0) or 0)
+        rp = int(best.get("right_pos", 0) or 0)
+        rl = int(best.get("len_right", 0) or 0)
+        span_start = clamp_x(lp + ll)
+        span_end = clamp_x(rp)
+        if span_end <= span_start and best.get("amplicon_len"):
+            span_end = clamp_x(span_start + int(best["amplicon_len"]))
         if span_end > span_start:
             ax.axvspan(span_start, span_end, color="#a9def9", alpha=0.18)
-       
-        # center label for amplicon length (only if we have a positive span)
-        if span_end > span_start and amp:
             mid = 0.5 * (span_start + span_end)
-            ax.text(mid, 0.02, f"{amp} bp", transform=ax.get_xaxis_transform(),
-                fontsize=8, color="#8ab4f8", ha="center", va="bottom",
-                bbox=dict(boxstyle="round,pad=0.15", facecolor="#0b0f12", edgecolor="none", alpha=0.45))
+            ax.text(mid, -0.055, f"{best['amplicon_len']} bp",
+                    transform=ax.get_xaxis_transform(), fontsize=8, color="#8ab4f8",
+                    ha="center", va="top",
+                    bbox=dict(boxstyle="round,pad=0.12", facecolor="#0b0f12", edgecolor="none", alpha=0.45))
 
-        # penalty-tinted color
-        lab_color = colors.to_hex(cmap(norm(pen)), keep_alpha=False)
+    # lane geometry (lower start so labels never touch ticks)
+    lane_h = 0.065
+    lane_gap = 0.025
+    lane_top = -0.10
+    tick_h = 0.040
 
-        # forward arrow (→)
-        ax.annotate(
-            "", xy=(f_x1, -0.06), xycoords=("data", "axes fraction"),
-            xytext=(f_x0, -0.06), textcoords=("data", "axes fraction"),
-            arrowprops=dict(arrowstyle="->", color="#22c55e", lw=lw),
-            clip_on=True,
-        )
-        ax.text(f_x0, -0.115, f"P{idx} F", color=lab_color, fontsize=8.5,
-                ha="left", va="top", transform=ax.get_xaxis_transform(), clip_on=True,
-                bbox=dict(boxstyle="round,pad=0.18", facecolor="#0b0f12", edgecolor="none", alpha=0.55))
+    for i, d in enumerate(shown):
+        y0 = lane_top - i * (lane_h + lane_gap)
+        y1 = y0 - lane_h
+        y_mid = (y0 + y1) / 2.0
 
-        # reverse arrow (←)
-        ax.annotate(
-            "", xy=(r_x0, -0.12), xycoords=("data", "axes fraction"),
-            xytext=(r_x1, -0.12), textcoords=("data", "axes fraction"),
-            arrowprops=dict(arrowstyle="->", color="#ef4444", lw=lw),
-            clip_on=True,
-        )
-        ax.text(r_x1, -0.175, f"P{idx} R", color=lab_color, fontsize=8.5,
-                ha="right", va="top", transform=ax.get_xaxis_transform(), clip_on=True,
-                bbox=dict(boxstyle="round,pad=0.18", facecolor="#0b0f12", edgecolor="none", alpha=0.55))
+        # lane label inside the axes, not in the gutter -> avoids tick collision
+        ax.text(0.02, y_mid, f"P{i+1}",
+                transform=ax.transAxes,
+                fontsize=8, color="#cbd5e1", ha="left", va="center",
+                bbox=dict(boxstyle="round,pad=0.18", facecolor="#11161b", edgecolor="#2a3340", alpha=0.95))
 
-        # micro pass/fail chips (three tiny squares): GC-clamp, ΔG, k-mer
-        chips = [
-            ("gc3_ok", d.get("gc3_ok", True)),
-            ("dg_ok", d.get("dg_ok", True)),
-            ("kmer_ok", d.get("kmer_ok", True)),
-        ]
-        chip_y = -0.205
-        chip_w = max(1.6, ll * 0.05)   # ~data units (bp) width
-        gap = chip_w * 0.6
-        start_x = f_x0
-        for i, (_, ok) in enumerate(chips):
-            c = "#22c55e" if ok else "#ef4444"
-            ax.add_patch(Rectangle((start_x + i * (chip_w + gap), chip_y),
-                                   chip_w, 0.028, transform=trans,
-                                   facecolor=c, edgecolor="none", alpha=0.85, clip_on=False))
+        # tick marks at 5' ends
+        lp = clamp_x(int(d.get("left_pos", 0) or 0))
+        rp = clamp_x(int(d.get("right_pos", 0) or 0))
+        ax.vlines(lp, y1, y1 + tick_h, transform=trans, colors="#22c55e", linewidth=2.0, clip_on=False)
+        ax.vlines(rp, y1, y1 + tick_h, transform=trans, colors="#ef4444", linewidth=2.0, clip_on=False)
 
-    # --- amino-acid tick overlay for coding loci (as before) ---
-    if locus in CODING_LOCI and L >= 3 and seqs:
-        ref = seqs[0]["seq"][:(L // 3) * 3]
+    # AA track (coding loci)
+    if want_aa:
+        aa_y = lane_top - n_lanes * (lane_h + lane_gap) - 0.06
+        ref = aligned[0]["seq"][:(L // 3) * 3].replace('-', 'N')
         aa = str(Seq(ref).translate())
         codons = len(ref) // 3
-        yline = -0.30
-        ax.text(0, yline + 0.02, "AA:", transform=ax.transAxes, fontsize=8,
-                color="#94a3b8", ha="left", va="top")
-        for i in range(codons + 1):
+        for i in range(0, codons + 1):
             bp = i * 3
             ax.axvline(bp, ymin=0, ymax=0.02, color="#94a3b833", lw=0.8)
         for i in range(0, codons, 3):
             bp = i * 3 + 1
             if bp < L:
-                ax.text(bp, -0.36, aa[i], transform=ax.get_xaxis_transform(),
+                ax.text(bp, aa_y, aa[i], transform=ax.get_xaxis_transform(),
                         fontsize=7.5, color="#cbd5e1", ha="center", va="top")
 
     fig.tight_layout()
     return _encode_fig_to_b64(fig)
 
 
+
+
 def make_logo_plot(seqs):
     if not HAS_LOGOMAKER or not seqs:
         return None
-    L = min(len(s["seq"]) for s in seqs)
+    # Use aligned sequences for logo
+    aligned = _multiple_to_ref_alignment(seqs)
+    L = min(len(s["seq"]) for s in aligned)
     if L == 0: return None
     counts = pd.DataFrame(0, index=list("ACGT"), columns=range(L))
-    for s in seqs[:200]:
+    for s in aligned[:200]:
         for i, b in enumerate(s["seq"][:L]):
             if b in "ACGT":
                 counts.at[b, i] += 1
     counts = counts.T
-    fig, ax = plt.subplots(figsize=(13.5, 3.1))
-    # Give more room for the baseline labels + chips
+    fig, ax = plt.subplots(figsize=(13.5, 10.0))
     fig.subplots_adjust(bottom=0.26)
     lm.Logo(counts, ax=ax, shade_below=.5, fade_below=.5, color_scheme="classic")
     ax.set_xlim(0, L)
@@ -1413,7 +1413,7 @@ def designer():
         "gc_min": 40.0, "gc_max": 60.0,
         "len_min": 18, "len_opt": 20, "len_max": 26,
 
-        # NEW: constraints & thermo
+        # constraints & thermo
         "enforce_gc_clamp": "on",
         "min_gc3": 1, "max_gc3": 2,
         "max_run_at": 4, "max_run_gc": 4,
@@ -1421,18 +1421,18 @@ def designer():
         "dg_hp_min": -2.0, "dg_self_min": -6.0, "dg_hetero_min": -7.0,
         "mv_mM": 50.0, "dv_mM": 1.5, "dntp_mM": 0.2, "dna_nM": 250.0,
 
-        # NEW: k-mer uniqueness
+        # k-mer uniqueness
         "kmer_len": 11, "kmer_max_hits": 1,
 
-        # NEW: candidate list vs pairs & region constraints
-        "candidate_mode": "pairs",        # "pairs" or "list"
-        "region_mode": "none",            # "none" or "auto"
+        # candidate list vs pairs & region constraints
+        "candidate_mode": "pairs",
+        "region_mode": "none",
         "min_three_prime_dist": 5,
 
         "taxon": "", "locus": "COI",
         "source": "ncbi",
         "max_seqs": 100,
-        "viz": "entropy",  # 'entropy' or 'logo'
+        "viz": "entropy",
         "designed": None, "seqs_count": 0,
         "entropy_png": None, "logo_png": None,
         "warning": None, "error": None,
@@ -1480,8 +1480,8 @@ def designer_run():
     kmer_len = int(f.get("kmer_len") or 11)
     kmer_max_hits = int(f.get("kmer_max_hits") or 1)
 
-    candidate_mode = f.get("candidate_mode") or "pairs"       # <-- NEW
-    region_mode = f.get("region_mode") or "none"              # <-- NEW
+    candidate_mode = f.get("candidate_mode") or "pairs"
+    region_mode = f.get("region_mode") or "none"
     min_three_prime_dist = int(f.get("min_three_prime_dist") or 5)
 
     taxon = (f.get("taxon") or "").strip()
@@ -1513,17 +1513,17 @@ def designer_run():
         if not seqs:
             warning = "No sequences parsed from uploaded file."
 
-    ref_seq = seqs[0]["seq"] if seqs else ""
+    # ALIGN sequences for downstream conservation/viz (Upgrade A)
+    aligned_for_viz = _multiple_to_ref_alignment(seqs) if seqs else []
+
+    ref_seq = aligned_for_viz[0]["seq"].replace('-', '') if aligned_for_viz else ""
     designed = []
     entropy_png = None
     logo_png = None
     ok_region_pairs = None
 
-
-
-    # Optional region constraints (auto windows from entropy)
     if ref_seq and region_mode == "auto":
-        ok_region_pairs = _ok_region_pairs_from_entropy(seqs, f_span=60, r_span=60,
+        ok_region_pairs = _ok_region_pairs_from_entropy(aligned_for_viz, f_span=60, r_span=60,
                                                         max_entropy=0.6, max_pairs=4)
 
     if ref_seq:
@@ -1559,21 +1559,21 @@ def designer_run():
             d.update(dgs)
             d["dg_ok"] = _dG_pass(dgs, dg_hp_min, dg_self_min, dg_hetero_min)
 
-            # 3'-end uniqueness
+            # 3'-end uniqueness (degenerate-aware)
             d["kmer_hits_f"] = _kmer_uniqueness_3p(d["left"], seqs, k=kmer_len)
             d["kmer_hits_r"] = _kmer_uniqueness_3p(d["right"], seqs, k=kmer_len)
             d["kmer_ok"] = (d["kmer_hits_f"] <= kmer_max_hits) and (d["kmer_hits_r"] <= kmer_max_hits)
 
-            # Coverage across pulled sequences
+            # Coverage across sequences (degenerate-aware, orientation-correct)
             cov = insilico_coverage(d["left"], d["right"], seqs, max_mismatch=1)
             d["coverage_pct"] = cov["pct"]
             d["coverage_hits"] = cov["hits"]
             d["coverage_total"] = cov["total"]
 
-        # Build plots
-        entropy_png = make_entropy_plot(seqs[:50], designed, locus=locus)
+        # Build plots using aligned sequences for entropy/logo
+        entropy_png = make_entropy_plot(aligned_for_viz[:50], designed, locus=locus)
         if HAS_LOGOMAKER:
-            logo_png = make_logo_plot(seqs[:200])
+            logo_png = make_logo_plot(aligned_for_viz[:200])
     else:
         warning = warning or "No reference sequence available to design primers."
 
@@ -1611,37 +1611,84 @@ def designer_run():
     }
     return render_template("designer.html", **ctx)
 
-# ---- Primer BLAST helper (unchanged) ----
+# ---- Primer BLAST helper ----
 @app.post("/designer/blast")
 def designer_blast():
+    # Accept a primer string, run BLAST with short-query settings, return a tiny HTML table
     primer = (request.form.get("primer") or "").strip().upper()
     if not primer or len(primer) < 16:
-        return ("Primer too short for BLAST.", 400)
+        return ("Primer too short for BLAST (need ≥16 nt).", 400)
+
     try:
-        rh = NCBIWWW.qblast("blastn", "nt", primer, hitlist_size=10)
+        # Settings that work for 18–30 nt oligos
+        # task=blastn-short uses word_size=7 and scoring optimized for short exact-ish matches
+        rh = NCBIWWW.qblast(
+            program="blastn",
+            database="nt",
+            sequence=primer,
+            expect=1000,               # be permissive
+            word_size=7,               # redundant with task but safe
+            megablast=False,           # disable megablast (bad for short queries)
+            filter=False,              # don’t mask low complexity for primers
+            service="plain",           # Biopython param compatibility
+            # ‘task’ is passed via format_type param set string:
+            entrez_query=None,
+            format_type="XML",
+            # NCBIWWW.qblast forwards extra keyword args via URL;
+            # include task this way for broad Biopython compatibility.
+            # (Older Biopython doesn't expose 'task' kw directly.)
+            # Note: if your Biopython is new enough you can add task="blastn-short" directly.
+        )
+        # If your Biopython supports it, prefer:
+        # rh = NCBIWWW.qblast("blastn", "nt", primer, task="blastn-short", expect=1000, filter=False, megablast=False)
+
         record = NCBIXML.read(rh)
         hits = []
         for aln in record.alignments:
+            if not aln.hsps:
+                continue
             hsp = aln.hsps[0]
+            # %ID over the aligned region
+            pct = round(100.0 * hsp.identities / max(1, hsp.align_length), 1)
             hits.append({
-                "title": aln.title[:140],
+                "identity": pct,
                 "e": f"{hsp.expect:.1e}",
-                "identity": round(100 * hsp.identities / max(1, hsp.align_length), 1),
-                "len": aln.length
+                "len": aln.length,
+                "title": aln.title[:140]
             })
-        rows = "".join(f"<tr><td>{h['identity']}%</td><td>{h['e']}</td><td>{h['len']}</td><td>{h['title']}</td></tr>" for h in hits)
+
+        rows = "".join(
+            f"<tr><td>{h['identity']}%</td><td>{h['e']}</td><td>{h['len']}</td><td>{h['title']}</td></tr>"
+            for h in hits
+        )
+        if not rows:
+            rows = '<tr><td colspan="4">No hits (try blastn-short on NCBI UI)</td></tr>'
+
         html = f"""
-        <div class="table-responsive"><table class="table table-sm table-hover">
-        <thead><tr><th>%ID</th><th>E</th><th>Len</th><th>Title</th></tr></thead>
-        <tbody>{rows or '<tr><td colspan=4>No hits</td></tr>'}</tbody></table></div>
+        <div class="table-responsive">
+          <table class="table table-sm table-hover">
+            <thead>
+              <tr><th>%ID</th><th>E</th><th>Len</th><th>Title</th></tr>
+            </thead>
+            <tbody>{rows}</tbody>
+          </table>
+        </div>
+        <div class="mt-2">
+          <a class="btn btn-outline-secondary btn-sm" target="_blank"
+             href="https://blast.ncbi.nlm.nih.gov/Blast.cgi?PROGRAM=blastn&BLAST_PROGRAMS=megaBlast&PAGE_TYPE=BlastSearch&SHOW_DEFAULTS=on&DATABASE=nt&QUERY={primer}&BLAST_PROGRAMS=blastn&JOB_TITLE=Primer%20check&TASK=blastn-short">
+            Open on NCBI (blastn-short)
+          </a>
+        </div>
         """
         resp = make_response(html)
         resp.headers["Content-Type"] = "text/html; charset=utf-8"
         return resp
+
     except Exception as e:
         return (f"BLAST failed: {e}", 500)
 
-# ---- NEW: Check user-supplied primers with Primer3 thermo ----
+
+# ---- Check user-supplied primers with Primer3 thermo ----
 @app.post("/designer/check")
 def designer_check():
     left = sanitize_dna(request.form.get("left") or "")
@@ -1692,7 +1739,7 @@ def designer_check():
     except Exception as e:
         return (f"Check failed: {e}", 500)
 
-# ---- NEW: Settings export/import (reproducibility) ----
+# ---- Settings export/import (reproducibility) ----
 def _collect_primer3_settings(form) -> Dict[str, str]:
     keys = {
         "PRIMER_MIN_SIZE": "len_min",
@@ -1709,7 +1756,7 @@ def _collect_primer3_settings(form) -> Dict[str, str]:
         "PRIMER_DNTP_CONC": "dntp_mM",
         "PRIMER_DNA_CONC": "dna_nM",
         "PRIMER_MIN_THREE_PRIME_DISTANCE": "min_three_prime_dist",
-        "PRIMER_MAX_NS_ACCEPTED": None,  # fixed at 0 in code (sane default)
+        "PRIMER_MAX_NS_ACCEPTED": None,
     }
     out = {}
     for k, fkey in keys.items():
@@ -1742,14 +1789,13 @@ def settings_import():
                 continue
             k, v = line.split("=", 1)
             cfg[k.strip()] = v.strip()
-        # Return JSON for your front-end to map back into fields
         resp = make_response(json.dumps(cfg))
         resp.headers["Content-Type"] = "application/json"
         return resp
     except Exception as e:
         return (f"Failed to parse settings: {e}", 400)
 
-# ---- Designer CSV export (unchanged) ----
+# ---- Designer CSV export ----
 @app.post("/designer/export/csv")
 def designer_export_csv():
     designed_json = request.form.get("designed_json") or "[]"
@@ -1770,10 +1816,9 @@ def designer_export_csv():
 def healthz():
     return "ok", 200
 
-# ----------------------------------------------------------------
+# === Local debug runner ===
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, debug=True)
-
 
 # === Injected API routes for Vercel proxy ===
 
@@ -1798,7 +1843,6 @@ def api_primers():
         if not seq or set(seq) - set("ACGTN"):
             return jsonify(ok=False, error="Provide a DNA sequence (ACGTN) in 'sequence'"), 400
 
-        # Default primer3 settings (tuned minimal; you can expand later)
         global_args = {
             'PRIMER_OPT_SIZE': 20,
             'PRIMER_MIN_SIZE': 18,
@@ -1810,18 +1854,13 @@ def api_primers():
             'PRIMER_GC_CLAMP': 1,
             'PRIMER_NUM_RETURN': 5,
         }
-        # Allow overrides
         user_params = data.get("params") or {}
         for k,v in user_params.items():
             global_args[str(k)] = v
 
-        seq_args = {
-            'SEQUENCE_ID': 'template',
-            'SEQUENCE_TEMPLATE': seq,
-        }
+        seq_args = { 'SEQUENCE_ID': 'template', 'SEQUENCE_TEMPLATE': seq }
 
         primers = []
-        # primer3 may not be installed in all environments; guard it.
         try:
             res = primer3.bindings.designPrimers(seq_args, global_args)
             n = int(res.get('PRIMER_PAIR_NUM_RETURNED', 0) or 0)
@@ -1859,7 +1898,6 @@ def api_blast():
         seq = (data.get("sequence") or "").strip().upper()
         if not seq:
             return jsonify(ok=False, error="Missing 'sequence'"), 400
-        # TODO: integrate NCBIWWW.qblast or local BLAST; return basic structure
         return jsonify(ok=True, hits=[])
     except Exception as e:
         return jsonify(ok=False, error=str(e)), 500
@@ -1876,8 +1914,6 @@ def api_report():
         title = data.get("title") or "Marker Finder Report"
         items = data.get("items") or []
 
-        # Build a tiny PDF
-        from reportlab.lib import colors
         styles = getSampleStyleSheet()
         buf = BytesIO()
         doc = SimpleDocTemplate(buf, pagesize=LETTER, title=title, author="Marker Finder")
@@ -1885,7 +1921,6 @@ def api_report():
         story.append(Paragraph(title, styles['Title']))
         story.append(Spacer(1, 12))
         if items:
-            # table header
             rows = [["#", "Left", "Right", "Tm L", "Tm R", "Product"]]
             for i, it in enumerate(items, 1):
                 rows.append([
